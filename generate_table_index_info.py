@@ -23,14 +23,14 @@ PREPARE_SQL_FILE = "sql/prepare.sql"
 CREATE_TABLE_SQL = f"""
 CREATE TABLE IF NOT EXISTS {SITEMERGE_TABLE_NAME} (
     id INT AUTO_INCREMENT PRIMARY KEY,
-    siteDatabase VARCHAR(255) NOT NULL,
-    sitetable VARCHAR(255) NOT NULL,
-    ClusteredIndex VARCHAR(10) NOT NULL,
-    ClusteredColumns TEXT,
-    Com_clustedInd VARCHAR(10) NOT NULL,
-    TABLE_ROWS BIGINT,
+    site_database VARCHAR(255) NOT NULL,
+    site_table VARCHAR(255) NOT NULL,
+    clustered_index VARCHAR(10) NOT NULL,
+    clustered_columns TEXT,
+    com_clusted_index VARCHAR(10) NOT NULL,
+    table_rows BIGINT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE KEY idx_database_table (siteDatabase, sitetable)
+    UNIQUE KEY idx_database_table (site_database, site_table)
 )
 """
 
@@ -159,7 +159,7 @@ class SiteMergeManager:
         
         insert_sql = f"""
         INSERT INTO {SITEMERGE_TABLE_NAME} 
-        (siteDatabase, sitetable, ClusteredIndex, ClusteredColumns, Com_clustedInd, TABLE_ROWS)
+        (site_database, site_table, clustered_index, clustered_columns, com_clusted_index, table_rows)
         VALUES (%s, %s, %s, %s, %s, %s)
         """
         
@@ -177,7 +177,7 @@ class SiteMergeManager:
         """Clear existing data for the target database"""
         try:
             with self.db_connection.connection.cursor() as cursor:
-                delete_sql = f"DELETE FROM {SITEMERGE_TABLE_NAME} WHERE siteDatabase = %s"
+                delete_sql = f"DELETE FROM {SITEMERGE_TABLE_NAME} WHERE site_database = %s"
                 cursor.execute(delete_sql, (target_database,))
                 deleted_rows = cursor.rowcount
                 self.db_connection.connection.commit()

@@ -1,6 +1,6 @@
 SELECT DISTINCT
-    t.TABLE_SCHEMA as siteDatabase,
-    t.TABLE_NAME as sitetable,
+    t.TABLE_SCHEMA as site_database,
+    t.TABLE_NAME as site_table,
     CASE 
         WHEN EXISTS (
             SELECT 1 FROM INFORMATION_SCHEMA.STATISTICS s2 
@@ -9,7 +9,7 @@ SELECT DISTINCT
             AND s2.INDEX_NAME = 'PRIMARY'
         ) THEN 'Yes'
         ELSE 'No'
-    END as ClusteredIndex,
+    END as clustered_index,
     CASE 
         WHEN EXISTS (
             SELECT 1 FROM INFORMATION_SCHEMA.STATISTICS s2 
@@ -24,8 +24,8 @@ SELECT DISTINCT
             AND s3.INDEX_NAME = 'PRIMARY'
         )
         ELSE NULL
-    END as ClusteredColumns,
-    'No' as Com_clustedInd,
+    END as clustered_columns,
+    'No' as com_clusted_index,
     t.TABLE_ROWS
 FROM 
     INFORMATION_SCHEMA.TABLES t
