@@ -13,10 +13,11 @@ import os
 from typing import Optional
 
 # Magic value for the target table name (configurable)
-SITEMERGE_TABLE_NAME = "sitemerge_table_index_info"
+SITEMERGE_TABLE_NAME = "sitemerge.sitemerge_table_index_info"
 
-# SQL file path
+# SQL file paths
 SQL_QUERY_FILE = "sql/table_index_query.sql"
+PREPARE_SQL_FILE = "sql/prepare.sql"
 
 # Create table DDL
 CREATE_TABLE_SQL = f"""
@@ -96,6 +97,32 @@ class SiteMergeManager:
             print(f"Error reading SQL file: {e}")
             sys.exit(1)
     
+    def execute_prepare_sql(self) -> None:
+        """Execute the prepare.sql script to initialize sitemerge database"""
+        try:
+            with open(PREPARE_SQL_FILE, 'r', encoding='utf-8') as file:
+                prepare_sql = file.read().strip()
+            
+            # Split SQL statements by semicolon and execute each one
+            statements = [stmt.strip() for stmt in prepare_sql.split(';') if stmt.strip()]
+            
+            with self.db_connection.connection.cursor() as cursor:
+                for statement in statements:
+                    if statement:
+                        cursor.execute(statement)
+                        result = cursor.fetchall()
+                        if result:
+                            print(f"Prepare SQL result: {result}")
+                
+                self.db_connection.connection.commit()
+                print("Database preparation completed successfully")
+                
+        except FileNotFoundError:
+            print(f"Warning: Prepare SQL file '{PREPARE_SQL_FILE}' not found, skipping database preparation")
+        except Exception as e:
+            print(f"Error executing prepare SQL: {e}")
+            sys.exit(1)
+    
     def execute_index_query(self, target_database: str) -> list:
         """Execute the index information query"""
         sql_query = self.load_sql_query()
@@ -149,6 +176,9 @@ class SiteMergeManager:
         """Main execution flow"""
         print(f"Starting SiteMerge process for database: {target_database}")
         print(f"Target table: {SITEMERGE_TABLE_NAME}")
+        
+        # Step 0: Initialize sitemerge database
+        self.execute_prepare_sql()
         
         # Step 1: Create target table
         self.create_target_table()
