@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS {SITEMERGE_TABLE_NAME} (
     Com_clustedInd VARCHAR(10) NOT NULL,
     TABLE_ROWS BIGINT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    INDEX idx_database_table (siteDatabase, sitetable)
+    UNIQUE KEY idx_database_table (siteDatabase, sitetable)
 )
 """
 
@@ -143,6 +143,20 @@ class SiteMergeManager:
             print("No data to insert")
             return
         
+        # Process results to modify ClusteredColumns for non-clustered indexes
+        processed_results = []
+        for result in results:
+            # Convert tuple to list for modification
+            result_list = list(result)
+            
+            # Check if ClusteredIndex is 'No' (index 2 in the tuple)
+            if len(result_list) >= 4 and result_list[2] == 'No':
+                # Set ClusteredColumns to '_tidb_rowid' (index 3 in the tuple)
+                result_list[3] = '_tidb_rowid'
+                print(f"Modified ClusteredColumns for table {result_list[1]}: {result_list[2]} -> _tidb_rowid")
+            
+            processed_results.append(tuple(result_list))
+        
         insert_sql = f"""
         INSERT INTO {SITEMERGE_TABLE_NAME} 
         (siteDatabase, sitetable, ClusteredIndex, ClusteredColumns, Com_clustedInd, TABLE_ROWS)
@@ -151,9 +165,9 @@ class SiteMergeManager:
         
         try:
             with self.db_connection.connection.cursor() as cursor:
-                cursor.executemany(insert_sql, results)
+                cursor.executemany(insert_sql, processed_results)
                 self.db_connection.connection.commit()
-                print(f"Successfully inserted {len(results)} records into '{SITEMERGE_TABLE_NAME}'")
+                print(f"Successfully inserted {len(processed_results)} records into '{SITEMERGE_TABLE_NAME}'")
         except Exception as e:
             print(f"Error inserting data: {e}")
             self.db_connection.connection.rollback()

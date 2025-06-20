@@ -1,21 +1,36 @@
-SELECT 
-    s.TABLE_SCHEMA as siteDatabase,
-    s.TABLE_NAME as sitetable,
+SELECT DISTINCT
+    t.TABLE_SCHEMA as siteDatabase,
+    t.TABLE_NAME as sitetable,
     CASE 
-        WHEN s.INDEX_NAME = 'PRIMARY' THEN 'Yes'
+        WHEN EXISTS (
+            SELECT 1 FROM INFORMATION_SCHEMA.STATISTICS s2 
+            WHERE s2.TABLE_SCHEMA = t.TABLE_SCHEMA 
+            AND s2.TABLE_NAME = t.TABLE_NAME 
+            AND s2.INDEX_NAME = 'PRIMARY'
+        ) THEN 'Yes'
         ELSE 'No'
     END as ClusteredIndex,
-    GROUP_CONCAT(s.COLUMN_NAME ORDER BY s.SEQ_IN_INDEX) as ClusteredColumns,
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 FROM INFORMATION_SCHEMA.STATISTICS s2 
+            WHERE s2.TABLE_SCHEMA = t.TABLE_SCHEMA 
+            AND s2.TABLE_NAME = t.TABLE_NAME 
+            AND s2.INDEX_NAME = 'PRIMARY'
+        ) THEN (
+            SELECT GROUP_CONCAT(s3.COLUMN_NAME ORDER BY s3.SEQ_IN_INDEX)
+            FROM INFORMATION_SCHEMA.STATISTICS s3
+            WHERE s3.TABLE_SCHEMA = t.TABLE_SCHEMA 
+            AND s3.TABLE_NAME = t.TABLE_NAME 
+            AND s3.INDEX_NAME = 'PRIMARY'
+        )
+        ELSE NULL
+    END as ClusteredColumns,
     'No' as Com_clustedInd,
     t.TABLE_ROWS
 FROM 
-    INFORMATION_SCHEMA.STATISTICS s
-JOIN 
-    INFORMATION_SCHEMA.TABLES t ON s.TABLE_SCHEMA = t.TABLE_SCHEMA AND s.TABLE_NAME = t.TABLE_NAME
+    INFORMATION_SCHEMA.TABLES t
 WHERE 
-    s.TABLE_SCHEMA = %s
-    AND s.INDEX_NAME = 'PRIMARY'
-GROUP BY 
-    s.TABLE_SCHEMA, s.TABLE_NAME, s.INDEX_NAME, t.TABLE_ROWS
+    t.TABLE_SCHEMA = %s
+    AND t.TABLE_TYPE = 'BASE TABLE'
 ORDER BY 
-    s.TABLE_NAME; 
+    t.TABLE_NAME; 
