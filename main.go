@@ -27,6 +27,7 @@ func (c *DBConfig) GetDSN() string {
 var (
 	dbConfig DBConfig
 	pageSize int
+	threads  int
 )
 
 var rootCmd = &cobra.Command{
@@ -73,6 +74,7 @@ func init() {
 	// Subcommand specific flags
 	tableIndexCmd.Flags().Bool("keep-existing", false, "Keep existing data (do not clear before inserting)")
 	pageInfoCmd.Flags().IntVar(&pageSize, "page-size", 500, "Number of rows per page")
+	pageInfoCmd.Flags().IntVar(&threads, "threads", 1, "Number of worker threads (1-512, default: 1)")
 
 	// Add subcommands
 	rootCmd.AddCommand(tableIndexCmd)
@@ -86,24 +88,29 @@ func main() {
 	}
 }
 
-func connectDB() (*sql.DB, error) {
+func connectDB(maxConnections int) (*sql.DB, error) {
 	db, err := sql.Open("mysql", dbConfig.GetDSN())
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database connection: %w", err)
 	}
 
+	// Configure connection pool
+	db.SetMaxOpenConns(maxConnections)
+	db.SetMaxIdleConns(maxConnections / 2)
+
 	if err := db.Ping(); err != nil {
 		return nil, fmt.Errorf("failed to ping database: %w", err)
 	}
 
-	fmt.Printf("✅ Successfully connected to TiDB at %s:%d\n", dbConfig.Host, dbConfig.Port)
+	fmt.Printf("✅ Successfully connected to TiDB at %s:%d (Max connections: %d)\n",
+		dbConfig.Host, dbConfig.Port, maxConnections)
 	return db, nil
 }
 
 func runTableIndex(cmd *cobra.Command, args []string) {
 	keepExisting, _ := cmd.Flags().GetBool("keep-existing")
 
-	db, err := connectDB()
+	db, err := connectDB(10) // Use fixed connections for table-index command
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "❌ %v\n", err)
 		os.Exit(1)
@@ -118,14 +125,22 @@ func runTableIndex(cmd *cobra.Command, args []string) {
 }
 
 func runPageInfo(cmd *cobra.Command, args []string) {
-	db, err := connectDB()
+	// Validate threads parameter
+	if threads < 1 || threads > 512 {
+		fmt.Fprintf(os.Stderr, "❌ Thread count must be between 1 and 512, got: %d\n", threads)
+		os.Exit(1)
+	}
+
+	// Connect to database with connection pool sized for threads
+	maxConnections := threads * 2 // Allow 2 connections per thread
+	db, err := connectDB(maxConnections)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "❌ %v\n", err)
 		os.Exit(1)
 	}
 	defer db.Close()
 
-	generator := NewPageInfoGenerator(db, pageSize)
+	generator := NewPageInfoGenerator(db, pageSize, threads)
 	if err := generator.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "❌ %v\n", err)
 		os.Exit(1)

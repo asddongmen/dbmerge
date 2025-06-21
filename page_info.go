@@ -3,7 +3,10 @@ package main
 import (
 	"database/sql"
 	"fmt"
+	"log"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -77,27 +80,51 @@ type PageInfo struct {
 	PageSize int
 }
 
-// PageInfoGenerator manages page information generation
+// TableTask represents a task for processing a single table
+type TableTask struct {
+	ResumePoint ResumePoint
+	IsResume    bool
+}
+
+// TaskResult represents the result of processing a table task
+type TaskResult struct {
+	TableName   string
+	Success     bool
+	Error       error
+	PagesCount  int
+	ProcessTime time.Duration
+}
+
+// PageInfoGenerator manages page information generation with multi-threading support
 type PageInfoGenerator struct {
 	db       *sql.DB
 	pageSize int
+	threads  int
+	// Statistics tracking
+	mu              sync.Mutex
+	processedTables int
+	totalTables     int
+	totalPages      int
+	failedTables    int
 }
 
 // NewPageInfoGenerator creates a new page info generator
-func NewPageInfoGenerator(db *sql.DB, pageSize int) *PageInfoGenerator {
+func NewPageInfoGenerator(db *sql.DB, pageSize int, threads int) *PageInfoGenerator {
 	return &PageInfoGenerator{
 		db:       db,
 		pageSize: pageSize,
+		threads:  threads,
 	}
 }
 
-// Run executes the page info generation process with resume support
+// Run executes the page info generation process with multi-threading support
 func (p *PageInfoGenerator) Run() error {
 	startTime := time.Now()
-	fmt.Println("🚀 Starting SiteMerge Page Info Generation Process")
-	fmt.Printf("📏 Page size: %d\n", p.pageSize)
-	fmt.Printf("📦 Batch size: %d\n", batchSize)
-	fmt.Println()
+	log.Println("Starting SiteMerge Page Info Generation Process")
+	log.Printf("Page size: %d", p.pageSize)
+	log.Printf("Batch size: %d", batchSize)
+	log.Printf("Worker threads: %d", p.threads)
+	log.Println()
 
 	// Step 1: Create page_info table
 	if err := p.createPageInfoTables(); err != nil {
@@ -110,82 +137,170 @@ func (p *PageInfoGenerator) Run() error {
 		return fmt.Errorf("failed to get resume point: %w", err)
 	}
 
-	if resumePoint != nil {
-		fmt.Printf("🔄 Found interrupted processing for table `%s`.`%s`\n",
-			resumePoint.SiteDatabase, resumePoint.SiteTable)
-		fmt.Printf("📍 Resuming from key %d with %d rows already processed\n",
-			resumePoint.LastEndKey, resumePoint.ProcessedRows)
-		fmt.Println()
-
-		// Process the interrupted table
-		if err := p.processSingleTable(*resumePoint, true); err != nil {
-			fmt.Printf("❌ Failed to resume table `%s`.`%s`: %v\n",
-				resumePoint.SiteDatabase, resumePoint.SiteTable, err)
-			p.updateProgress(resumePoint.SiteDatabase, resumePoint.SiteTable, "failed", 0, 0, 0)
-		} else {
-			fmt.Println("✅ Resumed table completed")
-		}
-		fmt.Println()
-	}
-
-	// Step 3: Get remaining tables to process
-	tables, err := p.getTablesToProcess()
+	// Step 3: Get all tables to process (sorted)
+	tables, err := p.printAndSortTablesByDatabase()
 	if err != nil {
 		return fmt.Errorf("failed to get tables to process: %w", err)
 	}
 
 	if len(tables) == 0 {
-		fmt.Println("⚠️  No tables found to process")
+		log.Println("No tables found to process")
 		return nil
 	}
 
-	// Filter out already completed tables
+	// Step 4: Prepare tasks
+	var tasks []TableTask
+
+	// Add resume task if exists
+	if resumePoint != nil {
+		log.Printf("Found interrupted processing for table `%s`.`%s`",
+			resumePoint.SiteDatabase, resumePoint.SiteTable)
+		log.Printf("Resuming from key %d with %d rows already processed",
+			resumePoint.LastEndKey, resumePoint.ProcessedRows)
+		log.Println()
+
+		tasks = append(tasks, TableTask{
+			ResumePoint: *resumePoint,
+			IsResume:    true,
+		})
+	}
+
+	// Filter out already completed tables and add them as tasks
 	remainingTables := p.filterRemainingTables(tables)
-	if len(remainingTables) == 0 {
-		fmt.Println("✅ All tables have been processed!")
+	if len(remainingTables) == 0 && resumePoint == nil {
+		log.Println("All tables have been processed!")
 		return nil
 	}
 
-	fmt.Printf("📋 Found %d remaining tables to process\n", len(remainingTables))
-	fmt.Println()
+	log.Printf("Found %d remaining tables to process", len(remainingTables))
+	log.Println()
 
-	// Step 4: Process remaining tables
-	totalPagesGenerated := 0
-	processedTables := 0
-
+	// Add remaining tables as tasks
 	for _, table := range remainingTables {
-		resumePoint := ResumePoint{
-			SiteDatabase:     table.SiteDatabase,
-			SiteTable:        table.SiteTable,
-			ClusteredColumns: table.ClusteredColumns,
-			TableRows:        table.TableRows,
-			LastEndKey:       0,
-			ProcessedRows:    0,
-		}
-
-		if err := p.processSingleTable(resumePoint, false); err != nil {
-			fmt.Printf("❌ Failed to process table `%s`.`%s`: %v\n",
-				table.SiteDatabase, table.SiteTable, err)
-			p.updateProgress(table.SiteDatabase, table.SiteTable, "failed", 0, 0, 0)
+		// Skip if already added as resume task
+		if resumePoint != nil &&
+			table.SiteDatabase == resumePoint.SiteDatabase &&
+			table.SiteTable == resumePoint.SiteTable {
 			continue
 		}
 
-		processedTables++
-		fmt.Println("✅ Table completed")
-		fmt.Println()
+		tasks = append(tasks, TableTask{
+			ResumePoint: ResumePoint{
+				SiteDatabase:     table.SiteDatabase,
+				SiteTable:        table.SiteTable,
+				ClusteredColumns: table.ClusteredColumns,
+				TableRows:        table.TableRows,
+				LastEndKey:       0,
+				ProcessedRows:    0,
+			},
+			IsResume: false,
+		})
 	}
 
-	// Step 5: Print summary
+	if len(tasks) == 0 {
+		log.Println("No tasks to process")
+		return nil
+	}
+
+	p.totalTables = len(tasks)
+	log.Printf("Total tasks to process: %d", len(tasks))
+	log.Println()
+
+	// Step 5: Process tasks with worker pool
+	if err := p.processTasksWithWorkerPool(tasks); err != nil {
+		return fmt.Errorf("failed to process tasks: %w", err)
+	}
+
+	// Step 6: Print summary
 	elapsed := time.Since(startTime)
-	fmt.Println("=" + strings.Repeat("=", 59))
-	fmt.Println("📊 PROCESSING SUMMARY")
-	fmt.Println("=" + strings.Repeat("=", 59))
-	fmt.Printf("✅ Tables processed: %d/%d\n", processedTables, len(remainingTables))
-	fmt.Printf("📄 Total pages generated: %d\n", totalPagesGenerated)
-	fmt.Printf("⏱️  Total time elapsed: %.2f seconds\n", elapsed.Seconds())
-	fmt.Println("🏁 Processing completed successfully!")
+	log.Println("=" + strings.Repeat("=", 59))
+	log.Println("PROCESSING SUMMARY")
+	log.Println("=" + strings.Repeat("=", 59))
+	log.Printf("Tasks processed: %d/%d", p.processedTables, p.totalTables)
+	log.Printf("Failed tasks: %d", p.failedTables)
+	log.Printf("Total pages generated: %d", p.totalPages)
+	log.Printf("Total time elapsed: %.2f seconds", elapsed.Seconds())
+	log.Printf("Average time per table: %.2f seconds", elapsed.Seconds()/float64(p.totalTables))
+	log.Println("Processing completed successfully!")
 
 	return nil
+}
+
+// processTasksWithWorkerPool processes tasks using a worker pool pattern
+func (p *PageInfoGenerator) processTasksWithWorkerPool(tasks []TableTask) error {
+	// Create channels
+	taskChan := make(chan TableTask, len(tasks))
+	resultChan := make(chan TaskResult, len(tasks))
+
+	// Start workers
+	var wg sync.WaitGroup
+	for i := 0; i < p.threads; i++ {
+		wg.Add(1)
+		go p.worker(i+1, taskChan, resultChan, &wg)
+	}
+
+	// Send tasks to workers
+	go func() {
+		defer close(taskChan)
+		for _, task := range tasks {
+			taskChan <- task
+		}
+	}()
+
+	// Collect results
+	go func() {
+		wg.Wait()
+		close(resultChan)
+	}()
+
+	// Process results
+	for result := range resultChan {
+		p.mu.Lock()
+		p.processedTables++
+		if result.Success {
+			p.totalPages += result.PagesCount
+			log.Printf("✅ [%d/%d] Table %s completed (%d pages, %.2fs)",
+				p.processedTables, p.totalTables, result.TableName,
+				result.PagesCount, result.ProcessTime.Seconds())
+		} else {
+			p.failedTables++
+			log.Printf("❌ [%d/%d] Table %s failed: %v (%.2fs)",
+				p.processedTables, p.totalTables, result.TableName,
+				result.Error, result.ProcessTime.Seconds())
+		}
+		p.mu.Unlock()
+	}
+
+	return nil
+}
+
+// worker processes tasks from the task channel
+func (p *PageInfoGenerator) worker(workerID int, taskChan <-chan TableTask, resultChan chan<- TaskResult, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	log.Printf("🔄 Worker %d started", workerID)
+
+	for task := range taskChan {
+		startTime := time.Now()
+		tableName := fmt.Sprintf("%s.%s", task.ResumePoint.SiteDatabase, task.ResumePoint.SiteTable)
+
+		log.Printf("🔄 Worker %d processing table %s", workerID, tableName)
+
+		pagesCount, err := p.processSingleTable(task.ResumePoint, task.IsResume)
+		processTime := time.Since(startTime)
+
+		result := TaskResult{
+			TableName:   tableName,
+			Success:     err == nil,
+			Error:       err,
+			PagesCount:  pagesCount,
+			ProcessTime: processTime,
+		}
+
+		resultChan <- result
+	}
+
+	log.Printf("🔄 Worker %d finished", workerID)
 }
 
 func (p *PageInfoGenerator) createPageInfoTables() error {
@@ -199,8 +314,8 @@ func (p *PageInfoGenerator) createPageInfoTables() error {
 		return fmt.Errorf("failed to create progress table: %w", err)
 	}
 
-	fmt.Printf("📋 Page info table '%s' created or already exists\n", pageInfoTableName)
-	fmt.Printf("📋 Progress table '%s' created or already exists\n", progressTableName)
+	log.Printf("Page info table '%s' created or already exists", pageInfoTableName)
+	log.Printf("Progress table '%s' created or already exists", progressTableName)
 	return nil
 }
 
@@ -227,7 +342,7 @@ func (p *PageInfoGenerator) getTablesToProcess() ([]TableToProcess, error) {
 		tables = append(tables, table)
 	}
 
-	fmt.Printf("📊 Found %d tables to process\n", len(tables))
+	log.Printf("Found %d tables to process", len(tables))
 	return tables, nil
 }
 
@@ -309,7 +424,7 @@ func (p *PageInfoGenerator) filterRemainingTables(tables []TableToProcess) []Tab
 	for _, table := range tables {
 		status, err := p.getProgressStatus(table.SiteDatabase, table.SiteTable)
 		if err != nil {
-			fmt.Printf("⚠️  Error checking status for %s.%s: %v\n",
+			log.Printf("Error checking status for %s.%s: %v",
 				table.SiteDatabase, table.SiteTable, err)
 			continue
 		}
@@ -330,12 +445,12 @@ func (p *PageInfoGenerator) clearExistingPageInfo(dbName, tableName string) erro
 
 	deletedRows, _ := result.RowsAffected()
 	if deletedRows > 0 {
-		fmt.Printf("  🧹 Cleared %d existing page records\n", deletedRows)
+		log.Printf("  Cleared %d existing page records", deletedRows)
 	}
 	return nil
 }
 
-func (p *PageInfoGenerator) processSingleTable(resumePoint ResumePoint, isResume bool) error {
+func (p *PageInfoGenerator) processSingleTable(resumePoint ResumePoint, isResume bool) (int, error) {
 	dbName := resumePoint.SiteDatabase
 	tableName := resumePoint.SiteTable
 	divideColumn := resumePoint.ClusteredColumns
@@ -344,19 +459,19 @@ func (p *PageInfoGenerator) processSingleTable(resumePoint ResumePoint, isResume
 	existingProcessedRows := resumePoint.ProcessedRows
 
 	if isResume {
-		fmt.Printf("  🔄 Resuming table `%s`.`%s` from key %d (already processed %d rows)\n",
+		log.Printf("  Resuming table `%s`.`%s` from key %d (already processed %d rows)",
 			dbName, tableName, resumeFromKey, existingProcessedRows)
 	} else {
-		fmt.Printf("  📊 Processing table `%s`.`%s` (%d rows)\n", dbName, tableName, tableRows)
+		log.Printf("  Processing table `%s`.`%s` (%d rows)", dbName, tableName, tableRows)
 		// Clear existing page info for this table if starting fresh
 		if err := p.clearExistingPageInfo(dbName, tableName); err != nil {
-			return err
+			return 0, err
 		}
 	}
 
 	// Update progress status to 'processing'
 	if err := p.updateProgress(dbName, tableName, "processing", resumeFromKey, tableRows, existingProcessedRows); err != nil {
-		return fmt.Errorf("failed to update progress: %w", err)
+		return 0, fmt.Errorf("failed to update progress: %w", err)
 	}
 
 	var lastMaxID *int64
@@ -373,7 +488,7 @@ func (p *PageInfoGenerator) processSingleTable(resumePoint ResumePoint, isResume
 		// Generate raw data for current batch
 		batchValues, maxEndKey, err := p.generatePageInfoBatch(dbName, tableName, divideColumn, lastMaxID)
 		if err != nil {
-			return fmt.Errorf("failed to generate page info batch: %w", err)
+			return 0, fmt.Errorf("failed to generate page info batch: %w", err)
 		}
 
 		if len(batchValues) == 0 {
@@ -384,12 +499,12 @@ func (p *PageInfoGenerator) processSingleTable(resumePoint ResumePoint, isResume
 		batchCount++
 		processedRows += int64(len(batchValues))
 
-		fmt.Printf("    📥 Fetched batch %d: %d rows (total fetched: %d, total processed: %d)\n",
+		log.Printf("    Fetched batch %d: %d rows (total fetched: %d, total processed: %d)",
 			batchCount, len(batchValues), len(allValues), processedRows)
 
 		// Update progress periodically
 		if err := p.updateProgress(dbName, tableName, "processing", maxEndKey, tableRows, processedRows); err != nil {
-			return fmt.Errorf("failed to update progress: %w", err)
+			return 0, fmt.Errorf("failed to update progress: %w", err)
 		}
 
 		// Check if we've processed all data
@@ -430,19 +545,19 @@ func (p *PageInfoGenerator) processSingleTable(resumePoint ResumePoint, isResume
 
 		// Insert all page info at once
 		if err := p.insertPageInfoBatch(dbName, tableName, pageData); err != nil {
-			return fmt.Errorf("failed to insert page info batch: %w", err)
+			return 0, fmt.Errorf("failed to insert page info batch: %w", err)
 		}
 		totalPages = len(pageData)
 
-		fmt.Printf("    📄 Generated %d pages from %d rows\n", totalPages, len(allValues))
+		log.Printf("    Generated %d pages from %d rows", totalPages, len(allValues))
 	}
 
 	// Mark as completed
 	if err := p.updateProgress(dbName, tableName, "completed", 0, tableRows, processedRows); err != nil {
-		return fmt.Errorf("failed to mark as completed: %w", err)
+		return 0, fmt.Errorf("failed to mark as completed: %w", err)
 	}
 
-	return nil
+	return totalPages, nil
 }
 
 func (p *PageInfoGenerator) generatePageInfoBatch(dbName, tableName, divideColumn string,
@@ -522,4 +637,92 @@ VALUES (?, ?, ?, ?, ?, ?)`, pageInfoTableName)
 	}
 
 	return tx.Commit()
+}
+
+// DatabaseTableStats represents statistics for tables in a database
+type DatabaseTableStats struct {
+	DatabaseName string
+	Tables       []TableToProcess
+	TotalCount   int
+	TotalRows    int64
+}
+
+// printAndSortTablesByDatabase fetches all tables, groups them by database,
+// prints statistics for each database, and returns all tables sorted by database and table name in lexicographical order
+func (p *PageInfoGenerator) printAndSortTablesByDatabase() ([]TableToProcess, error) {
+	// Get all tables first
+	allTables, err := p.getTablesToProcess()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get tables to process: %w", err)
+	}
+
+	if len(allTables) == 0 {
+		log.Println("No tables found to process")
+		return allTables, nil
+	}
+
+	// Group tables by database
+	dbTableMap := make(map[string][]TableToProcess)
+	for _, table := range allTables {
+		dbTableMap[table.SiteDatabase] = append(dbTableMap[table.SiteDatabase], table)
+	}
+
+	// Get sorted database names
+	var databaseNames []string
+	for dbName := range dbTableMap {
+		databaseNames = append(databaseNames, dbName)
+	}
+	sort.Strings(databaseNames)
+
+	// Print statistics for each database and sort tables within each database
+	var sortedTables []TableToProcess
+	var totalDatabases int
+	var totalTables int
+	var totalRows int64
+
+	log.Println("=" + strings.Repeat("=", 59))
+	log.Println("DATABASE AND TABLE STATISTICS")
+	log.Println("=" + strings.Repeat("=", 59))
+
+	for _, dbName := range databaseNames {
+		tables := dbTableMap[dbName]
+
+		// Sort tables within database by table name (lexicographical order)
+		sort.Slice(tables, func(i, j int) bool {
+			return tables[i].SiteTable < tables[j].SiteTable
+		})
+
+		// Calculate database statistics
+		var dbTotalRows int64
+		for _, table := range tables {
+			dbTotalRows += table.TableRows
+		}
+
+		// Print database statistics
+		log.Printf("Database: %s", dbName)
+		log.Printf("  Table count: %d", len(tables))
+		log.Printf("  Total rows: %d", dbTotalRows)
+		log.Printf("  Tables:")
+
+		for i, table := range tables {
+			log.Printf("    %d. %s (%d rows)", i+1, table.SiteTable, table.TableRows)
+		}
+		log.Println()
+
+		// Add to final sorted list
+		sortedTables = append(sortedTables, tables...)
+		totalDatabases++
+		totalTables += len(tables)
+		totalRows += dbTotalRows
+	}
+
+	// Print overall summary
+	log.Printf("OVERALL SUMMARY:")
+	log.Printf("  Total databases: %d", totalDatabases)
+	log.Printf("  Total tables: %d", totalTables)
+	log.Printf("  Total rows: %d", totalRows)
+	log.Println("=" + strings.Repeat("=", 59))
+	log.Println()
+
+	return sortedTables, nil
 }

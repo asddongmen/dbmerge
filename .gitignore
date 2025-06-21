@@ -1,6 +1,7 @@
 bin
 build
 vendor
+venv
 tools/bin
 tools/include
 tools/workload/bin
