@@ -1,0 +1,11 @@
+bin
+build
+vendor
+tools/bin
+tools/include
+tools/workload/bin
+
+.vscode
+.idea
+*.log
+.DS_Store
