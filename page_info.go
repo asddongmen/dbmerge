@@ -106,25 +106,99 @@ type PageInfoGenerator struct {
 	totalTables     int
 	totalPages      int
 	failedTables    int
+	// New statistics fields
+	totalProcessedRows int64
+	startTime          time.Time
+	currentTables      map[int]string // workerID -> current table name
+	stopStatsChan      chan bool
 }
 
 // NewPageInfoGenerator creates a new page info generator
 func NewPageInfoGenerator(db *sql.DB, pageSize int, threads int) *PageInfoGenerator {
 	return &PageInfoGenerator{
-		db:       db,
-		pageSize: pageSize,
-		threads:  threads,
+		db:            db,
+		pageSize:      pageSize,
+		threads:       threads,
+		currentTables: make(map[int]string),
+		stopStatsChan: make(chan bool),
 	}
+}
+
+// startStatsGoroutine starts a goroutine that prints statistics every 5 seconds
+func (p *PageInfoGenerator) startStatsGoroutine() {
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				p.printCurrentStats()
+			case <-p.stopStatsChan:
+				return
+			}
+		}
+	}()
+}
+
+// stopStatsGoroutine stops the statistics printing goroutine
+func (p *PageInfoGenerator) stopStatsGoroutine() {
+	close(p.stopStatsChan)
+}
+
+// printCurrentStats prints current processing statistics
+func (p *PageInfoGenerator) printCurrentStats() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	elapsed := time.Since(p.startTime)
+	if elapsed.Seconds() == 0 {
+		return
+	}
+
+	// Calculate QPS
+	qps := float64(p.totalProcessedRows) / elapsed.Seconds()
+
+	// Get current processing tables
+	var currentTableNames []string
+	for _, tableName := range p.currentTables {
+		if tableName != "" {
+			currentTableNames = append(currentTableNames, tableName)
+		}
+	}
+
+	log.Println("📊 " + strings.Repeat("=", 50))
+	log.Printf("📊 PROCESSING STATISTICS (Every 5s)")
+	log.Printf("📊 Processed tables: %d/%d (%.1f%%)",
+		p.processedTables, p.totalTables,
+		float64(p.processedTables)/float64(p.totalTables)*100)
+
+	if len(currentTableNames) > 0 {
+		log.Printf("📊 Currently processing: %v", currentTableNames)
+	} else {
+		log.Printf("📊 Currently processing: No active tables")
+	}
+
+	log.Printf("📊 Total processed rows: %d", p.totalProcessedRows)
+	log.Printf("📊 Processing speed: %.2f rows/sec", qps)
+	log.Printf("📊 Elapsed time: %.1f seconds", elapsed.Seconds())
+	log.Println("📊 " + strings.Repeat("=", 50))
 }
 
 // Run executes the page info generation process with multi-threading support
 func (p *PageInfoGenerator) Run() error {
 	startTime := time.Now()
+	p.startTime = startTime // Initialize start time for statistics
+
 	log.Println("Starting SiteMerge Page Info Generation Process")
 	log.Printf("Page size: %d", p.pageSize)
 	log.Printf("Batch size: %d", batchSize)
 	log.Printf("Worker threads: %d", p.threads)
 	log.Println()
+
+	// Start statistics goroutine
+	p.startStatsGoroutine()
+	defer p.stopStatsGoroutine()
 
 	// Step 1: Create page_info table
 	if err := p.createPageInfoTables(); err != nil {
@@ -284,10 +358,20 @@ func (p *PageInfoGenerator) worker(workerID int, taskChan <-chan TableTask, resu
 		startTime := time.Now()
 		tableName := fmt.Sprintf("%s.%s", task.ResumePoint.SiteDatabase, task.ResumePoint.SiteTable)
 
+		// Update current table being processed
+		p.mu.Lock()
+		p.currentTables[workerID] = tableName
+		p.mu.Unlock()
+
 		log.Printf("🔄 Worker %d processing table %s", workerID, tableName)
 
 		pagesCount, err := p.processSingleTable(task.ResumePoint, task.IsResume)
 		processTime := time.Since(startTime)
+
+		// Clear current table when done
+		p.mu.Lock()
+		p.currentTables[workerID] = ""
+		p.mu.Unlock()
 
 		result := TaskResult{
 			TableName:   tableName,
@@ -499,8 +583,10 @@ func (p *PageInfoGenerator) processSingleTable(resumePoint ResumePoint, isResume
 		batchCount++
 		processedRows += int64(len(batchValues))
 
-		log.Printf("    Fetched batch %d: %d rows (total fetched: %d, total processed: %d)",
-			batchCount, len(batchValues), len(allValues), processedRows)
+		// Update global statistics
+		p.mu.Lock()
+		p.totalProcessedRows += int64(len(batchValues))
+		p.mu.Unlock()
 
 		// Update progress periodically
 		if err := p.updateProgress(dbName, tableName, "processing", maxEndKey, tableRows, processedRows); err != nil {
