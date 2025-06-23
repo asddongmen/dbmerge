@@ -284,6 +284,8 @@ func (p *PageInfoGenerator) Run() error {
 	log.Println("=" + strings.Repeat("=", 59))
 	log.Printf("Tasks processed: %d/%d", p.processedTables, p.totalTables)
 	log.Printf("Failed tasks: %d", p.failedTables)
+	log.Printf("Total processed rows: %d", p.totalProcessedRows)
+	log.Printf("Process rows per second: %.2f", float64(p.totalProcessedRows)/elapsed.Seconds())
 	log.Printf("Total pages generated: %d", p.totalPages)
 	log.Printf("Total time elapsed: %.2f seconds", elapsed.Seconds())
 	log.Printf("Average time per table: %.2f seconds", elapsed.Seconds()/float64(p.totalTables))
@@ -416,10 +418,72 @@ func (p *PageInfoGenerator) getTablesToProcess() ([]TableToProcess, error) {
 			table.TableRows = tableRows.Int64
 		}
 		tables = append(tables, table)
+
+		log.Printf("📋 Found table: %s.%s (clustered_columns: %s, rows: %d)",
+			table.SiteDatabase, table.SiteTable, table.ClusteredColumns, table.TableRows)
 	}
 
-	log.Printf("Found %d tables to process", len(tables))
+	log.Printf("📋 Total found %d tables to process from sitemerge_table_index_info", len(tables))
 	return tables, nil
+}
+
+// CheckTableExists checks if a specific table exists in sitemerge_table_index_info
+func (p *PageInfoGenerator) CheckTableExists(database, tableName string) (bool, error) {
+	query := `
+SELECT COUNT(*) 
+FROM sitemerge.sitemerge_table_index_info 
+WHERE site_database = ? AND site_table = ?`
+
+	var count int
+	err := p.db.QueryRow(query, database, tableName).Scan(&count)
+	if err != nil {
+		return false, fmt.Errorf("failed to check table existence: %w", err)
+	}
+
+	return count > 0, nil
+}
+
+// DiagnoseTable provides diagnostic information about why a table might not be processed
+func (p *PageInfoGenerator) DiagnoseTable(database, tableName string) error {
+	log.Printf("🔍 Diagnosing table: %s.%s", database, tableName)
+
+	// Check if table exists in sitemerge_table_index_info
+	exists, err := p.CheckTableExists(database, tableName)
+	if err != nil {
+		return fmt.Errorf("failed to check table existence: %w", err)
+	}
+
+	if !exists {
+		log.Printf("❌ Table %s.%s NOT found in sitemerge.sitemerge_table_index_info", database, tableName)
+		log.Printf("💡 Recommendation: Run the table index generation command first to populate sitemerge_table_index_info")
+		return nil
+	}
+
+	log.Printf("✅ Table %s.%s found in sitemerge.sitemerge_table_index_info", database, tableName)
+
+	// Check progress status
+	status, err := p.getProgressStatus(database, tableName)
+	if err != nil {
+		log.Printf("⚠️  Error checking progress status: %v", err)
+		return nil
+	}
+
+	log.Printf("📊 Progress status: %s", status.Status)
+	if status.Status == "completed" {
+		log.Printf("✅ Table already completed processing")
+
+		// Check if page_info records exist
+		countQuery := `SELECT COUNT(*) FROM sitemerge.page_info WHERE site_database = ? AND site_table = ?`
+		var pageCount int
+		err = p.db.QueryRow(countQuery, database, tableName).Scan(&pageCount)
+		if err != nil {
+			log.Printf("⚠️  Error checking page_info records: %v", err)
+		} else {
+			log.Printf("📄 Found %d page_info records for this table", pageCount)
+		}
+	}
+
+	return nil
 }
 
 func (p *PageInfoGenerator) getResumePoint() (*ResumePoint, error) {
@@ -500,15 +564,24 @@ func (p *PageInfoGenerator) filterRemainingTables(tables []TableToProcess) []Tab
 	for _, table := range tables {
 		status, err := p.getProgressStatus(table.SiteDatabase, table.SiteTable)
 		if err != nil {
-			log.Printf("Error checking status for %s.%s: %v",
+			log.Printf("⚠️  Error checking status for %s.%s: %v - including table for processing",
 				table.SiteDatabase, table.SiteTable, err)
+			// Include table for processing instead of skipping it
+			remaining = append(remaining, table)
 			continue
 		}
 
 		if status.Status != "completed" {
 			remaining = append(remaining, table)
+			log.Printf("🔄 Table %s.%s status: %s - will be processed",
+				table.SiteDatabase, table.SiteTable, status.Status)
+		} else {
+			log.Printf("✅ Table %s.%s status: completed - skipping",
+				table.SiteDatabase, table.SiteTable)
 		}
 	}
+
+	log.Printf("📋 Filtered %d tables for processing out of %d total tables", len(remaining), len(tables))
 	return remaining
 }
 
@@ -541,6 +614,8 @@ func (p *PageInfoGenerator) processSingleTable(resumePoint ResumePoint, isResume
 		log.Printf("  Processing table `%s`.`%s` (%d rows)", dbName, tableName, tableRows)
 		// Clear existing page info for this table if starting fresh
 		if err := p.clearExistingPageInfo(dbName, tableName); err != nil {
+			// Mark as failed and return error
+			p.updateProgress(dbName, tableName, "failed", resumeFromKey, tableRows, existingProcessedRows)
 			return 0, err
 		}
 	}
@@ -564,6 +639,8 @@ func (p *PageInfoGenerator) processSingleTable(resumePoint ResumePoint, isResume
 		// Generate raw data for current batch
 		batchValues, maxEndKey, err := p.generatePageInfoBatch(dbName, tableName, divideColumn, lastMaxID)
 		if err != nil {
+			// Mark as failed before returning error
+			p.updateProgress(dbName, tableName, "failed", resumeFromKey, tableRows, processedRows)
 			return 0, fmt.Errorf("failed to generate page info batch: %w", err)
 		}
 
@@ -582,6 +659,8 @@ func (p *PageInfoGenerator) processSingleTable(resumePoint ResumePoint, isResume
 
 		// Update progress periodically
 		if err := p.updateProgress(dbName, tableName, "processing", maxEndKey, tableRows, processedRows); err != nil {
+			// Mark as failed before returning error
+			p.updateProgress(dbName, tableName, "failed", maxEndKey, tableRows, processedRows)
 			return 0, fmt.Errorf("failed to update progress: %w", err)
 		}
 
@@ -623,6 +702,8 @@ func (p *PageInfoGenerator) processSingleTable(resumePoint ResumePoint, isResume
 
 		// Insert all page info at once
 		if err := p.insertPageInfoBatch(dbName, tableName, pageData); err != nil {
+			// Mark as failed before returning error
+			p.updateProgress(dbName, tableName, "failed", 0, tableRows, processedRows)
 			return 0, fmt.Errorf("failed to insert page info batch: %w", err)
 		}
 		totalPages = len(pageData)

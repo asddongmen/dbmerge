@@ -1,6 +1,7 @@
 package main
 
 import (
+	"database/sql"
 	"fmt"
 	"log"
 	"os"
@@ -17,6 +18,312 @@ func TestMain(m *testing.M) {
 	// Disable log output during tests
 	log.SetOutput(os.Stderr)
 	os.Exit(m.Run())
+}
+
+func TestFilterRemainingTables(t *testing.T) {
+	tests := []struct {
+		name          string
+		inputTables   []TableToProcess
+		mockSetup     func(mock sqlmock.Sqlmock)
+		expectedCount int
+		expectedNames []string
+	}{
+		{
+			name: "Tables with different statuses",
+			inputTables: []TableToProcess{
+				{SiteDatabase: "test", SiteTable: "table1", ClusteredColumns: "id", TableRows: 1000},
+				{SiteDatabase: "test", SiteTable: "table2", ClusteredColumns: "id", TableRows: 2000},
+				{SiteDatabase: "test", SiteTable: "table3", ClusteredColumns: "id", TableRows: 3000},
+			},
+			mockSetup: func(mock sqlmock.Sqlmock) {
+				// table1: new (no record)
+				mock.ExpectQuery("SELECT status, last_end_key, processed_rows").
+					WithArgs("test", "table1").
+					WillReturnError(sql.ErrNoRows)
+
+				// table2: completed
+				rows2 := sqlmock.NewRows([]string{"status", "last_end_key", "processed_rows"}).
+					AddRow("completed", 0, 2000)
+				mock.ExpectQuery("SELECT status, last_end_key, processed_rows").
+					WithArgs("test", "table2").
+					WillReturnRows(rows2)
+
+				// table3: processing
+				rows3 := sqlmock.NewRows([]string{"status", "last_end_key", "processed_rows"}).
+					AddRow("processing", 1500, 1500)
+				mock.ExpectQuery("SELECT status, last_end_key, processed_rows").
+					WithArgs("test", "table3").
+					WillReturnRows(rows3)
+			},
+			expectedCount: 2,
+			expectedNames: []string{"test.table1", "test.table3"},
+		},
+		{
+			name: "Error in progress check should include table",
+			inputTables: []TableToProcess{
+				{SiteDatabase: "test", SiteTable: "error_table", ClusteredColumns: "id", TableRows: 1000},
+				{SiteDatabase: "test", SiteTable: "good_table", ClusteredColumns: "id", TableRows: 2000},
+			},
+			mockSetup: func(mock sqlmock.Sqlmock) {
+				// error_table: database error
+				mock.ExpectQuery("SELECT status, last_end_key, processed_rows").
+					WithArgs("test", "error_table").
+					WillReturnError(fmt.Errorf("database connection error"))
+
+				// good_table: completed
+				rows := sqlmock.NewRows([]string{"status", "last_end_key", "processed_rows"}).
+					AddRow("completed", 0, 2000)
+				mock.ExpectQuery("SELECT status, last_end_key, processed_rows").
+					WithArgs("test", "good_table").
+					WillReturnRows(rows)
+			},
+			expectedCount: 1,
+			expectedNames: []string{"test.error_table"},
+		},
+		{
+			name: "All tables completed",
+			inputTables: []TableToProcess{
+				{SiteDatabase: "test", SiteTable: "table1", ClusteredColumns: "id", TableRows: 1000},
+				{SiteDatabase: "test", SiteTable: "table2", ClusteredColumns: "id", TableRows: 2000},
+			},
+			mockSetup: func(mock sqlmock.Sqlmock) {
+				// table1: completed
+				rows1 := sqlmock.NewRows([]string{"status", "last_end_key", "processed_rows"}).
+					AddRow("completed", 0, 1000)
+				mock.ExpectQuery("SELECT status, last_end_key, processed_rows").
+					WithArgs("test", "table1").
+					WillReturnRows(rows1)
+
+				// table2: completed
+				rows2 := sqlmock.NewRows([]string{"status", "last_end_key", "processed_rows"}).
+					AddRow("completed", 0, 2000)
+				mock.ExpectQuery("SELECT status, last_end_key, processed_rows").
+					WithArgs("test", "table2").
+					WillReturnRows(rows2)
+			},
+			expectedCount: 0,
+			expectedNames: []string{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create mock database
+			db, mock, err := sqlmock.New()
+			require.NoError(t, err)
+			defer db.Close()
+
+			// Setup mock expectations
+			tt.mockSetup(mock)
+
+			// Create PageInfoGenerator
+			generator := NewPageInfoGenerator(db, 1000, 4)
+
+			// Capture log output
+			var logOutput strings.Builder
+			log.SetOutput(&logOutput)
+			defer log.SetOutput(os.Stderr)
+
+			// Call the function under test
+			result := generator.filterRemainingTables(tt.inputTables)
+
+			// Verify the result
+			assert.Equal(t, tt.expectedCount, len(result), "Should return correct number of remaining tables")
+
+			actualNames := make([]string, len(result))
+			for i, table := range result {
+				actualNames[i] = fmt.Sprintf("%s.%s", table.SiteDatabase, table.SiteTable)
+			}
+			assert.ElementsMatch(t, tt.expectedNames, actualNames, "Should return correct table names")
+
+			// Verify all mock expectations were met
+			assert.NoError(t, mock.ExpectationsWereMet())
+		})
+	}
+}
+
+func TestCheckTableExists(t *testing.T) {
+	tests := []struct {
+		name      string
+		database  string
+		table     string
+		mockSetup func(mock sqlmock.Sqlmock)
+		expected  bool
+		wantErr   bool
+	}{
+		{
+			name:     "Table exists",
+			database: "test",
+			table:    "bank10",
+			mockSetup: func(mock sqlmock.Sqlmock) {
+				rows := sqlmock.NewRows([]string{"count"}).AddRow(1)
+				mock.ExpectQuery("SELECT COUNT\\(\\*\\)").
+					WithArgs("test", "bank10").
+					WillReturnRows(rows)
+			},
+			expected: true,
+			wantErr:  false,
+		},
+		{
+			name:     "Table does not exist",
+			database: "test",
+			table:    "nonexistent",
+			mockSetup: func(mock sqlmock.Sqlmock) {
+				rows := sqlmock.NewRows([]string{"count"}).AddRow(0)
+				mock.ExpectQuery("SELECT COUNT\\(\\*\\)").
+					WithArgs("test", "nonexistent").
+					WillReturnRows(rows)
+			},
+			expected: false,
+			wantErr:  false,
+		},
+		{
+			name:     "Database error",
+			database: "test",
+			table:    "error_table",
+			mockSetup: func(mock sqlmock.Sqlmock) {
+				mock.ExpectQuery("SELECT COUNT\\(\\*\\)").
+					WithArgs("test", "error_table").
+					WillReturnError(fmt.Errorf("database error"))
+			},
+			expected: false,
+			wantErr:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create mock database
+			db, mock, err := sqlmock.New()
+			require.NoError(t, err)
+			defer db.Close()
+
+			// Setup mock expectations
+			tt.mockSetup(mock)
+
+			// Create PageInfoGenerator
+			generator := NewPageInfoGenerator(db, 1000, 4)
+
+			// Call the function under test
+			result, err := generator.CheckTableExists(tt.database, tt.table)
+
+			// Verify the result
+			if tt.wantErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+				assert.Equal(t, tt.expected, result)
+			}
+
+			// Verify all mock expectations were met
+			assert.NoError(t, mock.ExpectationsWereMet())
+		})
+	}
+}
+
+func TestDiagnoseTable(t *testing.T) {
+	tests := []struct {
+		name      string
+		database  string
+		table     string
+		mockSetup func(mock sqlmock.Sqlmock)
+		wantErr   bool
+	}{
+		{
+			name:     "Table not in index info",
+			database: "test",
+			table:    "missing_table",
+			mockSetup: func(mock sqlmock.Sqlmock) {
+				// CheckTableExists returns false
+				rows := sqlmock.NewRows([]string{"count"}).AddRow(0)
+				mock.ExpectQuery("SELECT COUNT\\(\\*\\)").
+					WithArgs("test", "missing_table").
+					WillReturnRows(rows)
+			},
+			wantErr: false,
+		},
+		{
+			name:     "Table exists and completed",
+			database: "test",
+			table:    "completed_table",
+			mockSetup: func(mock sqlmock.Sqlmock) {
+				// CheckTableExists returns true
+				existsRows := sqlmock.NewRows([]string{"count"}).AddRow(1)
+				mock.ExpectQuery("SELECT COUNT\\(\\*\\)").
+					WithArgs("test", "completed_table").
+					WillReturnRows(existsRows)
+
+				// getProgressStatus returns completed
+				statusRows := sqlmock.NewRows([]string{"status", "last_end_key", "processed_rows"}).
+					AddRow("completed", 0, 1000)
+				mock.ExpectQuery("SELECT status, last_end_key, processed_rows").
+					WithArgs("test", "completed_table").
+					WillReturnRows(statusRows)
+
+				// Check page_info count
+				pageRows := sqlmock.NewRows([]string{"count"}).AddRow(10)
+				mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM sitemerge.page_info").
+					WithArgs("test", "completed_table").
+					WillReturnRows(pageRows)
+			},
+			wantErr: false,
+		},
+		{
+			name:     "Table exists but status check fails",
+			database: "test",
+			table:    "error_table",
+			mockSetup: func(mock sqlmock.Sqlmock) {
+				// CheckTableExists returns true
+				existsRows := sqlmock.NewRows([]string{"count"}).AddRow(1)
+				mock.ExpectQuery("SELECT COUNT\\(\\*\\)").
+					WithArgs("test", "error_table").
+					WillReturnRows(existsRows)
+
+				// getProgressStatus returns error
+				mock.ExpectQuery("SELECT status, last_end_key, processed_rows").
+					WithArgs("test", "error_table").
+					WillReturnError(fmt.Errorf("status check error"))
+			},
+			wantErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create mock database
+			db, mock, err := sqlmock.New()
+			require.NoError(t, err)
+			defer db.Close()
+
+			// Setup mock expectations
+			tt.mockSetup(mock)
+
+			// Create PageInfoGenerator
+			generator := NewPageInfoGenerator(db, 1000, 4)
+
+			// Capture log output
+			var logOutput strings.Builder
+			log.SetOutput(&logOutput)
+			defer log.SetOutput(os.Stderr)
+
+			// Call the function under test
+			err = generator.DiagnoseTable(tt.database, tt.table)
+
+			// Verify the result
+			if tt.wantErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+
+			// Verify log output contains expected diagnostic information
+			logStr := logOutput.String()
+			assert.Contains(t, logStr, fmt.Sprintf("🔍 Diagnosing table: %s.%s", tt.database, tt.table))
+
+			// Verify all mock expectations were met
+			assert.NoError(t, mock.ExpectationsWereMet())
+		})
+	}
 }
 
 func TestPrintAndSortTablesByDatabase(t *testing.T) {

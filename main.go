@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"fmt"
+	"log"
 	"os"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -130,7 +131,7 @@ func init() {
 
 func main() {
 	if err := rootCmd.Execute(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		log.Printf("Error: %v\n", err)
 		os.Exit(1)
 	}
 }
@@ -149,7 +150,7 @@ func connectDB(maxConnections int) (*sql.DB, error) {
 		return nil, fmt.Errorf("failed to ping database: %w", err)
 	}
 
-	fmt.Printf("✅ Successfully connected to TiDB at %s:%d (Max connections: %d)\n",
+	log.Printf("✅ Successfully connected to TiDB at %s:%d (Max connections: %d)\n",
 		dbConfig.Host, dbConfig.Port, maxConnections)
 	return db, nil
 }
@@ -168,7 +169,7 @@ func connectDestDB(maxConnections int) (*sql.DB, error) {
 		return nil, fmt.Errorf("failed to ping destination database: %w", err)
 	}
 
-	fmt.Printf("✅ Successfully connected to destination TiDB at %s:%d (Max connections: %d)\n",
+	log.Printf("✅ Successfully connected to destination TiDB at %s:%d (Max connections: %d)\n",
 		dstDbConfig.Host, dstDbConfig.Port, maxConnections)
 	return db, nil
 }
@@ -178,14 +179,14 @@ func runTableIndex(cmd *cobra.Command, args []string) {
 
 	db, err := connectDB(10) // Use fixed connections for table-index command
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "❌ %v\n", err)
+		log.Printf("❌ %v\n", err)
 		os.Exit(1)
 	}
 	defer db.Close()
 
 	manager := NewTableIndexManager(db)
 	if err := manager.Run(dbConfig.Database, !keepExisting); err != nil {
-		fmt.Fprintf(os.Stderr, "❌ %v\n", err)
+		log.Printf("❌ %v\n", err)
 		os.Exit(1)
 	}
 }
@@ -193,7 +194,7 @@ func runTableIndex(cmd *cobra.Command, args []string) {
 func runPageInfo(cmd *cobra.Command, args []string) {
 	// Validate threads parameter
 	if threads < 1 || threads > 512 {
-		fmt.Fprintf(os.Stderr, "❌ Thread count must be between 1 and 512, got: %d\n", threads)
+		log.Printf("❌ Thread count must be between 1 and 512, got: %d\n", threads)
 		os.Exit(1)
 	}
 
@@ -201,14 +202,14 @@ func runPageInfo(cmd *cobra.Command, args []string) {
 	maxConnections := threads * 2 // Allow 2 connections per thread
 	db, err := connectDB(maxConnections)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "❌ %v\n", err)
+		log.Printf("❌ %v\n", err)
 		os.Exit(1)
 	}
 	defer db.Close()
 
 	generator := NewPageInfoGenerator(db, pageSize, threads)
 	if err := generator.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "❌ %v\n", err)
+		log.Printf("❌ %v\n", err)
 		os.Exit(1)
 	}
 }
@@ -216,7 +217,7 @@ func runPageInfo(cmd *cobra.Command, args []string) {
 func runExport(cmd *cobra.Command, args []string) {
 	// Validate threads parameter
 	if threads < 1 || threads > 512 {
-		fmt.Fprintf(os.Stderr, "❌ Thread count must be between 1 and 512, got: %d\n", threads)
+		log.Printf("❌ Thread count must be between 1 and 512, got: %d\n", threads)
 		os.Exit(1)
 	}
 
@@ -224,24 +225,15 @@ func runExport(cmd *cobra.Command, args []string) {
 	maxConnections := threads * 3 // Allow more connections for export/import operations
 	sourceDB, err := connectDB(maxConnections)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "❌ Failed to connect to source database: %v\n", err)
+		log.Printf("❌ Failed to connect to source database: %v\n", err)
 		os.Exit(1)
 	}
 	defer sourceDB.Close()
 
-	// Connect to destination database
-	fmt.Printf("🔗 Connecting to destination database...\n")
-	destDB, err := connectDestDB(maxConnections)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "❌ Failed to connect to destination database: %v\n", err)
-		os.Exit(1)
-	}
-	defer destDB.Close()
-
 	// Create and run export manager
 	manager := NewExportManager(sourceDB, threads, tableName)
 	if err := manager.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "❌ %v\n", err)
+		log.Printf("❌ %v\n", err)
 		os.Exit(1)
 	}
 }
@@ -249,7 +241,7 @@ func runExport(cmd *cobra.Command, args []string) {
 func runImport(cmd *cobra.Command, args []string) {
 	// Validate threads parameter
 	if threads < 1 || threads > 512 {
-		fmt.Fprintf(os.Stderr, "❌ Thread count must be between 1 and 512, got: %d\n", threads)
+		log.Printf("❌ Thread count must be between 1 and 512, got: %d\n", threads)
 		os.Exit(1)
 	}
 
@@ -257,16 +249,16 @@ func runImport(cmd *cobra.Command, args []string) {
 	maxConnections := threads * 3 // Allow more connections for export/import operations
 	sourceDB, err := connectDB(maxConnections)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "❌ Failed to connect to source database: %v\n", err)
+		log.Printf("❌ Failed to connect to source database: %v\n", err)
 		os.Exit(1)
 	}
 	defer sourceDB.Close()
 
 	// Connect to destination database
-	fmt.Printf("🔗 Connecting to destination database...\n")
+	log.Printf("🔗 Connecting to destination database...\n")
 	destDB, err := connectDestDB(maxConnections)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "❌ Failed to connect to destination database: %v\n", err)
+		log.Printf("❌ Failed to connect to destination database: %v\n", err)
 		os.Exit(1)
 	}
 	defer destDB.Close()
@@ -274,7 +266,7 @@ func runImport(cmd *cobra.Command, args []string) {
 	// Create and run import manager
 	manager := NewImportManager(sourceDB, destDB, threads, tableName)
 	if err := manager.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "❌ %v\n", err)
+		log.Printf("❌ %v\n", err)
 		os.Exit(1)
 	}
 }
