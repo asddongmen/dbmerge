@@ -72,14 +72,6 @@ type ResumePoint struct {
 	ProcessedRows    int64
 }
 
-// PageInfo represents page information
-type PageInfo struct {
-	PageNum  int
-	StartKey int64
-	EndKey   int64
-	PageSize int
-}
-
 // TableTask represents a task for processing a single table
 type TableTask struct {
 	ResumePoint ResumePoint
