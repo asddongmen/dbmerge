@@ -30,7 +30,6 @@ var (
 	pageSize    int
 	threads     int
 	tableName   string
-	action      string
 )
 
 var rootCmd = &cobra.Command{
@@ -61,13 +60,22 @@ page_info records for efficient data processing with resume capability.`,
 	Run: runPageInfo,
 }
 
-var exportImportCmd = &cobra.Command{
-	Use:   "export-import",
-	Short: "Export/Import data between TiDB databases",
-	Long: `Export or import data between TiDB databases using page-based processing.
-This command reads page_info for sharding and maintains export/import status
+var exportCmd = &cobra.Command{
+	Use:   "export",
+	Short: "Export data from TiDB database",
+	Long: `Export data from TiDB database using page-based processing.
+This command reads page_info for sharding and maintains export status
 in the sitemerge.export_import_summary table with resume capability.`,
-	Run: runExportImport,
+	Run: runExport,
+}
+
+var importCmd = &cobra.Command{
+	Use:   "import",
+	Short: "Import data to TiDB database",
+	Long: `Import data to TiDB database using page-based processing.
+This command reads page_info for sharding and maintains import status
+in the sitemerge.export_import_summary table with resume capability.`,
+	Run: runImport,
 }
 
 func init() {
@@ -89,27 +97,35 @@ func init() {
 	pageInfoCmd.Flags().IntVar(&pageSize, "page-size", 500, "Number of rows per page")
 	pageInfoCmd.Flags().IntVar(&threads, "threads", 1, "Number of worker threads (1-512, default: 1)")
 
-	// Export/Import command flags
-	exportImportCmd.Flags().StringVar(&dstDbConfig.Host, "dst-host", "", "Destination TiDB host address (required)")
-	exportImportCmd.Flags().IntVar(&dstDbConfig.Port, "dst-port", 4000, "Destination TiDB port number")
-	exportImportCmd.Flags().StringVar(&dstDbConfig.User, "dst-user", "", "Destination TiDB username (required)")
-	exportImportCmd.Flags().StringVar(&dstDbConfig.Password, "dst-password", "", "Destination TiDB password (required)")
-	exportImportCmd.Flags().StringVar(&dstDbConfig.Database, "dst-db", "", "Destination database name (required)")
-	exportImportCmd.Flags().IntVar(&threads, "threads", 8, "Number of worker threads (1-512, default: 8)")
-	exportImportCmd.Flags().StringVar(&tableName, "table-name", "", "Specific table name to process (default: all tables)")
-	exportImportCmd.Flags().StringVar(&action, "action", "", "Action to perform: export or import (required)")
+	// Export command flags
+	// exportCmd.Flags().StringVar(&dstDbConfig.Host, "dst-host", "", "Destination TiDB host address (required)")
+	// exportCmd.Flags().IntVar(&dstDbConfig.Port, "dst-port", 4000, "Destination TiDB port number")
+	// exportCmd.Flags().StringVar(&dstDbConfig.User, "dst-user", "", "Destination TiDB username (required)")
+	// exportCmd.Flags().StringVar(&dstDbConfig.Password, "dst-password", "", "Destination TiDB password (required)")
+	// exportCmd.Flags().StringVar(&dstDbConfig.Database, "dst-database", "", "Destination database name (required)")
+	exportCmd.Flags().IntVar(&threads, "threads", 8, "Number of worker threads (1-512, default: 8)")
+	exportCmd.Flags().StringVar(&tableName, "table-name", "", "Specific table name to process (default: all tables)")
 
-	// Mark required flags for export-import command
-	exportImportCmd.MarkFlagRequired("dst-host")
-	exportImportCmd.MarkFlagRequired("dst-user")
-	exportImportCmd.MarkFlagRequired("dst-password")
-	exportImportCmd.MarkFlagRequired("dst-db")
-	exportImportCmd.MarkFlagRequired("action")
+	// Import command flags
+	importCmd.Flags().StringVar(&dstDbConfig.Host, "dst-host", "", "Destination TiDB host address (required)")
+	importCmd.Flags().IntVar(&dstDbConfig.Port, "dst-port", 4000, "Destination TiDB port number")
+	importCmd.Flags().StringVar(&dstDbConfig.User, "dst-user", "", "Destination TiDB username (required)")
+	importCmd.Flags().StringVar(&dstDbConfig.Password, "dst-password", "", "Destination TiDB password (required)")
+	importCmd.Flags().StringVar(&dstDbConfig.Database, "dst-database", "", "Destination database name (required)")
+	importCmd.Flags().IntVar(&threads, "threads", 8, "Number of worker threads (1-512, default: 8)")
+	importCmd.Flags().StringVar(&tableName, "table-name", "", "Specific table name to process (default: all tables)")
+
+	// Mark required flags for import command
+	importCmd.MarkFlagRequired("dst-host")
+	importCmd.MarkFlagRequired("dst-user")
+	importCmd.MarkFlagRequired("dst-password")
+	importCmd.MarkFlagRequired("dst-database")
 
 	// Add subcommands
 	rootCmd.AddCommand(tableIndexCmd)
 	rootCmd.AddCommand(pageInfoCmd)
-	rootCmd.AddCommand(exportImportCmd)
+	rootCmd.AddCommand(exportCmd)
+	rootCmd.AddCommand(importCmd)
 }
 
 func main() {
@@ -197,13 +213,7 @@ func runPageInfo(cmd *cobra.Command, args []string) {
 	}
 }
 
-func runExportImport(cmd *cobra.Command, args []string) {
-	// Validate action parameter
-	if action != "export" && action != "import" {
-		fmt.Fprintf(os.Stderr, "❌ Action must be 'export' or 'import', got: %s\n", action)
-		os.Exit(1)
-	}
-
+func runExport(cmd *cobra.Command, args []string) {
 	// Validate threads parameter
 	if threads < 1 || threads > 512 {
 		fmt.Fprintf(os.Stderr, "❌ Thread count must be between 1 and 512, got: %d\n", threads)
@@ -228,8 +238,41 @@ func runExportImport(cmd *cobra.Command, args []string) {
 	}
 	defer destDB.Close()
 
-	// Create and run export/import manager
-	manager := NewExportImportManager(sourceDB, destDB, threads, tableName, action)
+	// Create and run export manager
+	manager := NewExportManager(sourceDB, threads, tableName)
+	if err := manager.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "❌ %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func runImport(cmd *cobra.Command, args []string) {
+	// Validate threads parameter
+	if threads < 1 || threads > 512 {
+		fmt.Fprintf(os.Stderr, "❌ Thread count must be between 1 and 512, got: %d\n", threads)
+		os.Exit(1)
+	}
+
+	// Connect to source database
+	maxConnections := threads * 3 // Allow more connections for export/import operations
+	sourceDB, err := connectDB(maxConnections)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "❌ Failed to connect to source database: %v\n", err)
+		os.Exit(1)
+	}
+	defer sourceDB.Close()
+
+	// Connect to destination database
+	fmt.Printf("🔗 Connecting to destination database...\n")
+	destDB, err := connectDestDB(maxConnections)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "❌ Failed to connect to destination database: %v\n", err)
+		os.Exit(1)
+	}
+	defer destDB.Close()
+
+	// Create and run import manager
+	manager := NewImportManager(sourceDB, destDB, threads, tableName)
 	if err := manager.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "❌ %v\n", err)
 		os.Exit(1)

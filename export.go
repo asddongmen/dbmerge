@@ -7,7 +7,6 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -48,48 +47,35 @@ type ExportTask struct {
 	PageInfo PageInfo
 }
 
-// ImportTask represents a single import task
-type ImportTask struct {
-	Database string
-	Table    string
-	PageInfo PageInfo
-}
-
-// ExportImportManager manages the export/import operations
-type ExportImportManager struct {
+// ExportManager manages the export operations
+type ExportManager struct {
 	sourceDB           *sql.DB
-	destDB             *sql.DB
 	threads            int
 	tableName          string
-	action             string
 	ctx                context.Context
 	cancel             context.CancelFunc
 	wg                 sync.WaitGroup
 	exportTaskChan     chan ExportTask
-	importTaskChan     chan ImportTask
 	missingTables      []string
 	missingTablesMutex sync.Mutex
 }
 
-// NewExportImportManager creates a new export/import manager
-func NewExportImportManager(sourceDB, destDB *sql.DB, threads int, tableName, action string) *ExportImportManager {
+// NewExportManager creates a new export manager
+func NewExportManager(sourceDB *sql.DB, threads int, tableName string) *ExportManager {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &ExportImportManager{
+	return &ExportManager{
 		sourceDB:       sourceDB,
-		destDB:         destDB,
 		threads:        threads,
 		tableName:      tableName,
-		action:         action,
 		ctx:            ctx,
 		cancel:         cancel,
 		exportTaskChan: make(chan ExportTask, 100),
-		importTaskChan: make(chan ImportTask, 100),
 		missingTables:  make([]string, 0),
 	}
 }
 
 // CreateExportImportSummaryTable creates the export_import_summary table if it doesn't exist
-func (m *ExportImportManager) CreateExportImportSummaryTable() error {
+func (m *ExportManager) CreateExportImportSummaryTable() error {
 	createTableSQL := `
 		CREATE TABLE IF NOT EXISTS sitemerge.export_import_summary (
 			task_id BIGINT AUTO_INCREMENT PRIMARY KEY,
@@ -117,8 +103,8 @@ func (m *ExportImportManager) CreateExportImportSummaryTable() error {
 	return nil
 }
 
-// GetTablesToProcess returns the list of tables to process
-func (m *ExportImportManager) GetTablesToProcess() ([]string, error) {
+// GetTablesToProcess returns the list of tables to process for export
+func (m *ExportManager) GetTablesToProcess() ([]string, error) {
 	var tables []string
 
 	if m.tableName != "" {
@@ -149,8 +135,8 @@ func (m *ExportImportManager) GetTablesToProcess() ([]string, error) {
 	return tables, nil
 }
 
-// InitializeExportImportSummary initializes the export_import_summary table with pending records
-func (m *ExportImportManager) InitializeExportImportSummary(tables []string) error {
+// InitializeExportSummary initializes the export_import_summary table with pending records for export
+func (m *ExportManager) InitializeExportSummary(tables []string) error {
 	for _, table := range tables {
 		// Get total count from page_info_progress
 		var totalCount int64
@@ -174,7 +160,8 @@ func (m *ExportImportManager) InitializeExportImportSummary(tables []string) err
 			(site_database, site_table, total_count, export_status, import_status)
 			VALUES (?, ?, ?, 'pending', 'pending')
 			ON DUPLICATE KEY UPDATE 
-			total_count = VALUES(total_count)`
+			total_count = VALUES(total_count),
+			export_status = 'pending'`
 
 		_, err = m.sourceDB.Exec(insertSQL, dbConfig.Database, table, totalCount)
 		if err != nil {
@@ -187,7 +174,7 @@ func (m *ExportImportManager) InitializeExportImportSummary(tables []string) err
 }
 
 // ExportScheduler periodically scans for pending export tasks
-func (m *ExportImportManager) ExportScheduler() {
+func (m *ExportManager) ExportScheduler() {
 	defer m.wg.Done()
 
 	ticker := time.NewTicker(5 * time.Second)
@@ -204,11 +191,7 @@ func (m *ExportImportManager) ExportScheduler() {
 }
 
 // scheduleExportTasks scans for pending export tasks and schedules them
-func (m *ExportImportManager) scheduleExportTasks() {
-	if m.action != "export" {
-		return
-	}
-
+func (m *ExportManager) scheduleExportTasks() {
 	// Get pending export tasks
 	query := `
 		SELECT site_database, site_table 
@@ -246,7 +229,7 @@ func (m *ExportImportManager) scheduleExportTasks() {
 }
 
 // scheduleExportTasksForTable schedules export tasks for a specific table
-func (m *ExportImportManager) scheduleExportTasksForTable(database, table string) {
+func (m *ExportManager) scheduleExportTasksForTable(database, table string) {
 	query := `
 		SELECT id, site_database, site_table, page_num, start_key, end_key, page_size
 		FROM sitemerge.page_info 
@@ -300,103 +283,8 @@ func (m *ExportImportManager) scheduleExportTasksForTable(database, table string
 	}
 }
 
-// ImportScheduler periodically scans for import tasks
-func (m *ExportImportManager) ImportScheduler() {
-	defer m.wg.Done()
-
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-m.ctx.Done():
-			return
-		case <-ticker.C:
-			m.scheduleImportTasks()
-		}
-	}
-}
-
-// scheduleImportTasks scans for import tasks and schedules them
-func (m *ExportImportManager) scheduleImportTasks() {
-	if m.action != "import" {
-		return
-	}
-
-	// Get tables ready for import
-	query := `
-		SELECT site_database, site_table 
-		FROM sitemerge.export_import_summary 
-		WHERE export_status = 'success' AND import_status = 'pending'`
-
-	rows, err := m.sourceDB.Query(query)
-	if err != nil {
-		log.Printf("Error getting pending import tasks: %v", err)
-		return
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var database, table string
-		if err := rows.Scan(&database, &table); err != nil {
-			log.Printf("Error scanning import task: %v", err)
-			continue
-		}
-
-		// Update status to running
-		_, err = m.sourceDB.Exec(`
-			UPDATE sitemerge.export_import_summary 
-			SET import_status = 'running' 
-			WHERE site_database = ? AND site_table = ? AND import_status = 'pending'`,
-			database, table)
-		if err != nil {
-			log.Printf("Error updating import status to running: %v", err)
-			continue
-		}
-
-		// Get page info for this table
-		m.scheduleImportTasksForTable(database, table)
-	}
-}
-
-// scheduleImportTasksForTable schedules import tasks for a specific table
-func (m *ExportImportManager) scheduleImportTasksForTable(database, table string) {
-	query := `
-		SELECT id, site_database, site_table, page_num, start_key, end_key, page_size
-		FROM sitemerge.page_info 
-		WHERE site_database = ? AND site_table = ?`
-
-	rows, err := m.sourceDB.Query(query, database, table)
-	if err != nil {
-		log.Printf("Error getting page info for table %s.%s: %v", database, table, err)
-		return
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var pageInfo PageInfo
-		if err := rows.Scan(&pageInfo.ID, &pageInfo.SiteDatabase, &pageInfo.SiteTable,
-			&pageInfo.PageNum, &pageInfo.StartKey, &pageInfo.EndKey, &pageInfo.PageSize); err != nil {
-			log.Printf("Error scanning page info: %v", err)
-			continue
-		}
-
-		task := ImportTask{
-			Database: database,
-			Table:    table,
-			PageInfo: pageInfo,
-		}
-
-		select {
-		case m.importTaskChan <- task:
-		case <-m.ctx.Done():
-			return
-		}
-	}
-}
-
 // ExportWorker processes export tasks
-func (m *ExportImportManager) ExportWorker() {
+func (m *ExportManager) ExportWorker() {
 	defer m.wg.Done()
 
 	for {
@@ -410,7 +298,7 @@ func (m *ExportImportManager) ExportWorker() {
 }
 
 // processExportTask processes a single export task
-func (m *ExportImportManager) processExportTask(task ExportTask) {
+func (m *ExportManager) processExportTask(task ExportTask) {
 	// TODO: Implement actual export logic here
 	// For now, just simulate the export by marking it as complete
 	fmt.Printf("🔄 Exporting %s.%s page %d (keys: %d-%d)\n",
@@ -423,36 +311,8 @@ func (m *ExportImportManager) processExportTask(task ExportTask) {
 	m.checkAndUpdateExportStatus(task.Database, task.Table)
 }
 
-// ImportWorker processes import tasks
-func (m *ExportImportManager) ImportWorker() {
-	defer m.wg.Done()
-
-	for {
-		select {
-		case <-m.ctx.Done():
-			return
-		case task := <-m.importTaskChan:
-			m.processImportTask(task)
-		}
-	}
-}
-
-// processImportTask processes a single import task
-func (m *ExportImportManager) processImportTask(task ImportTask) {
-	// TODO: Implement actual import logic here
-	// For now, just simulate the import by marking it as complete
-	fmt.Printf("🔄 Importing %s.%s page %d (keys: %d-%d)\n",
-		task.Database, task.Table, task.PageInfo.PageNum, task.PageInfo.StartKey, task.PageInfo.EndKey)
-
-	// Simulate processing time
-	time.Sleep(100 * time.Millisecond)
-
-	// Check if all pages for this table are completed
-	m.checkAndUpdateImportStatus(task.Database, task.Table)
-}
-
 // checkAndUpdateExportStatus checks if all export tasks for a table are completed
-func (m *ExportImportManager) checkAndUpdateExportStatus(database, table string) {
+func (m *ExportManager) checkAndUpdateExportStatus(database, table string) {
 	// Get total pages for this table
 	var totalPages int64
 	err := m.sourceDB.QueryRow(`
@@ -479,36 +339,8 @@ func (m *ExportImportManager) checkAndUpdateExportStatus(database, table string)
 	}
 }
 
-// checkAndUpdateImportStatus checks if all import tasks for a table are completed
-func (m *ExportImportManager) checkAndUpdateImportStatus(database, table string) {
-	// Get total pages for this table
-	var totalPages int64
-	err := m.sourceDB.QueryRow(`
-		SELECT COUNT(*) FROM sitemerge.page_info 
-		WHERE site_database = ? AND site_table = ?`,
-		database, table).Scan(&totalPages)
-	if err != nil {
-		log.Printf("Error getting total pages for table %s.%s: %v", database, table, err)
-		return
-	}
-
-	// This is a simplified check - in a real implementation, you would need to track
-	// completion of individual pages. For now, we'll mark as success immediately.
-	now := time.Now()
-	_, err = m.sourceDB.Exec(`
-		UPDATE sitemerge.export_import_summary 
-		SET import_status = 'success', import_time = ?
-		WHERE site_database = ? AND site_table = ? AND import_status = 'running'`,
-		now, database, table)
-	if err != nil {
-		log.Printf("Error updating import status to success: %v", err)
-	} else {
-		fmt.Printf("✅ Import completed for table %s.%s\n", database, table)
-	}
-}
-
-// Run starts the export/import process
-func (m *ExportImportManager) Run() error {
+// Run starts the export process
+func (m *ExportManager) Run() error {
 	// Create export_import_summary table
 	if err := m.CreateExportImportSummaryTable(); err != nil {
 		return err
@@ -525,16 +357,16 @@ func (m *ExportImportManager) Run() error {
 	}
 
 	// Initialize export_import_summary
-	if err := m.InitializeExportImportSummary(tables); err != nil {
+	if err := m.InitializeExportSummary(tables); err != nil {
 		return err
 	}
 
 	// Print operation parameters
-	fmt.Printf("🚀 Starting %s operation with parameters:\n", strings.ToUpper(m.action))
+	fmt.Printf("🚀 Starting EXPORT operation with parameters:\n")
 	fmt.Printf("   Source DB: %s:%d/%s\n", dbConfig.Host, dbConfig.Port, dbConfig.Database)
+	fmt.Printf("   Dest DB: %s:%d/%s\n", dstDbConfig.Host, dstDbConfig.Port, dstDbConfig.Database)
 	fmt.Printf("   Tables: %v\n", tables)
 	fmt.Printf("   Threads: %d\n", m.threads)
-	fmt.Printf("   Action: %s\n", m.action)
 
 	// Set up signal handling for graceful shutdown
 	sigChan := make(chan os.Signal, 1)
@@ -546,28 +378,14 @@ func (m *ExportImportManager) Run() error {
 		m.cancel()
 	}()
 
-	// Start schedulers
-	if m.action == "export" {
-		m.wg.Add(1)
-		go m.ExportScheduler()
-	}
-
-	if m.action == "import" {
-		m.wg.Add(1)
-		go m.ImportScheduler()
-	}
+	// Start scheduler
+	m.wg.Add(1)
+	go m.ExportScheduler()
 
 	// Start worker threads
 	for i := 0; i < m.threads; i++ {
-		if m.action == "export" {
-			m.wg.Add(1)
-			go m.ExportWorker()
-		}
-
-		if m.action == "import" {
-			m.wg.Add(1)
-			go m.ImportWorker()
-		}
+		m.wg.Add(1)
+		go m.ExportWorker()
 	}
 
 	// Wait for completion or cancellation
@@ -575,7 +393,6 @@ func (m *ExportImportManager) Run() error {
 
 	// Close channels
 	close(m.exportTaskChan)
-	close(m.importTaskChan)
 
 	// Print missing tables if any
 	if len(m.missingTables) > 0 {
@@ -585,6 +402,6 @@ func (m *ExportImportManager) Run() error {
 		}
 	}
 
-	fmt.Printf("✅ %s operation completed\n", strings.ToUpper(m.action))
+	fmt.Printf("✅ EXPORT operation completed\n")
 	return nil
 }
