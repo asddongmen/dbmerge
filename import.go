@@ -245,7 +245,7 @@ func (m *ImportManager) getPendingImportTasks() ([]ImportTask, error) {
 		AND pos.import_status IN ('pending', 'failed')
 		AND pos.import_retry_count < 3
 		ORDER BY pi.site_database, pi.site_table, pi.page_num
-		LIMIT 100`
+		LIMIT 500`
 
 	rows, err := m.sourceDB.Query(query)
 	if err != nil {
@@ -321,6 +321,7 @@ func (m *ImportManager) processImportTask(task ImportTask) {
 		return
 	}
 
+	// TODO: cache the placeholders in memory
 	// Create column list for SELECT and INSERT statements
 	columnList := strings.Join(allColumns, ", ")
 	placeholders := strings.Repeat("?,", len(allColumns))
@@ -332,20 +333,20 @@ func (m *ImportManager) processImportTask(task ImportTask) {
 
 	if clusteredColumns == "_tidb_rowid" {
 		// For tables without clustered index, use _tidb_rowid
-		whereClause = fmt.Sprintf("WHERE %s >= ? AND %s <= ?", clusteredColumns, clusteredColumns)
+		whereClause = fmt.Sprintf("WHERE %s >= ? AND %s < ?", clusteredColumns, clusteredColumns)
 		args = append(args, task.PageInfo.StartKey, task.PageInfo.EndKey)
 	} else {
 		// For tables with clustered index, handle potentially composite keys
 		columns := strings.Split(clusteredColumns, ",")
 		if len(columns) == 1 {
 			// Single column clustered index
-			whereClause = fmt.Sprintf("WHERE %s >= ? AND %s <= ?", strings.TrimSpace(columns[0]), strings.TrimSpace(columns[0]))
+			whereClause = fmt.Sprintf("WHERE %s >= ? AND %s < ?", strings.TrimSpace(columns[0]), strings.TrimSpace(columns[0]))
 			args = append(args, task.PageInfo.StartKey, task.PageInfo.EndKey)
 		} else {
 			// For composite keys, we use the first column for range filtering
 			// This is a simplified approach - in reality, composite key handling would be more complex
 			firstColumn := strings.TrimSpace(columns[0])
-			whereClause = fmt.Sprintf("WHERE %s >= ? AND %s <= ?", firstColumn, firstColumn)
+			whereClause = fmt.Sprintf("WHERE %s >= ? AND %s < ?", firstColumn, firstColumn)
 			args = append(args, task.PageInfo.StartKey, task.PageInfo.EndKey)
 		}
 	}
@@ -422,7 +423,7 @@ func (m *ImportManager) processImportTask(task ImportTask) {
 	for _, rowData := range batchData {
 		_, err := stmt.Exec(rowData...)
 		if err != nil {
-			log.Printf("Error inserting row into table %s.%s: %v", task.Database, task.Table, err)
+			// log.Printf("Error inserting row into table %s.%s: %v", task.Database, task.Table, err)
 			// Continue with other rows instead of failing the entire batch
 			continue
 		}
@@ -572,6 +573,7 @@ func (m *ImportManager) getTableClusteredColumns(database, table string) (string
 }
 
 // getTableColumns retrieves all column names for a table
+// TODO: cache the columns in memory
 func (m *ImportManager) getTableColumns(database, table string) ([]string, error) {
 	query := `
 		SELECT COLUMN_NAME 

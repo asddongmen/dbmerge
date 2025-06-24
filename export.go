@@ -316,7 +316,7 @@ func (m *ExportManager) scheduleExportTasks() {
 
 	// Select up to 8 tables per round
 	const maxTablesPerRound = 8
-	const tasksPerTable = 100
+	const tasksPerTable = 500
 
 	selectedTables := tables
 	if len(tables) > maxTablesPerRound {
