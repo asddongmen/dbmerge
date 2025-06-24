@@ -150,12 +150,18 @@ func (m *ExportManager) CreateExportImportSummaryTable() error {
 			export_start_time DATETIME,
 			export_end_time DATETIME,
 			export_error TEXT,
+			export_completed_pages BIGINT DEFAULT 0,
+			export_failed_pages BIGINT DEFAULT 0,
+			export_running_pages BIGINT DEFAULT 0,
 			export_retry_count INT DEFAULT 0,
 			
 			-- Import related status
 			import_status ENUM('pending', 'running', 'success', 'failed', 'skipped') DEFAULT 'pending',
 			import_start_time DATETIME,
 			import_end_time DATETIME,
+			import_completed_pages BIGINT DEFAULT 0,
+			import_failed_pages BIGINT DEFAULT 0,
+			import_running_pages BIGINT DEFAULT 0,
 			import_error TEXT,
 			import_retry_count INT DEFAULT 0,
 			
@@ -316,7 +322,7 @@ func (m *ExportManager) scheduleExportTasks() {
 
 	// Select up to 8 tables per round
 	const maxTablesPerRound = 8
-	const tasksPerTable = 500
+	const tasksPerTable = 1000
 
 	selectedTables := tables
 	if len(tables) > maxTablesPerRound {

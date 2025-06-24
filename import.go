@@ -20,6 +20,16 @@ type ImportTask struct {
 	PageInfo PageInfo
 }
 
+// TableSQLCache caches SQL statements and column information for a table
+type TableSQLCache struct {
+	AllColumns       []string
+	ColumnList       string
+	Placeholders     string
+	SelectTemplate   string
+	InsertTemplate   string
+	ClusteredColumns string
+}
+
 // DetailedProgress represents detailed progress information for export and import
 type DetailedProgress struct {
 	TotalPages                 int64
@@ -46,6 +56,10 @@ type ImportManager struct {
 	missingTables      []string
 	missingTablesMutex sync.Mutex
 
+	// SQL cache for tables
+	sqlCache      map[string]*TableSQLCache
+	sqlCacheMutex sync.RWMutex
+
 	// Row statistics
 	totalImportedRows int64
 	lastImportedRows  int64
@@ -66,6 +80,7 @@ func NewImportManager(sourceDB, destDB *sql.DB, threads int, tableName string) *
 		importTaskChan: make(chan ImportTask, 100),
 		missingTables:  make([]string, 0),
 		lastStatsTime:  time.Now(),
+		sqlCache:       make(map[string]*TableSQLCache),
 	}
 }
 
@@ -305,39 +320,25 @@ func (m *ImportManager) processImportTask(task ImportTask) {
 		return
 	}
 
-	// Get table structure information (clustered columns)
-	clusteredColumns, err := m.getTableClusteredColumns(task.Database, task.Table)
+	// Get cached SQL statements for this table
+	sqlCache, err := m.getTableSQLCache(task.Database, task.Table)
 	if err != nil {
-		log.Printf("Error getting clustered columns for table %s.%s: %v", task.Database, task.Table, err)
-		m.markImportPageAsFailed(task.Database, task.Table, task.PageInfo.ID, fmt.Sprintf("Failed to get table structure: %v", err))
+		log.Printf("Error getting SQL cache for table %s.%s: %v", task.Database, task.Table, err)
+		m.markImportPageAsFailed(task.Database, task.Table, task.PageInfo.ID, fmt.Sprintf("Failed to get SQL cache: %v", err))
 		return
 	}
-
-	// Get all columns for the table
-	allColumns, err := m.getTableColumns(task.Database, task.Table)
-	if err != nil {
-		log.Printf("Error getting table columns for table %s.%s: %v", task.Database, task.Table, err)
-		m.markImportPageAsFailed(task.Database, task.Table, task.PageInfo.ID, fmt.Sprintf("Failed to get table columns: %v", err))
-		return
-	}
-
-	// TODO: cache the placeholders in memory
-	// Create column list for SELECT and INSERT statements
-	columnList := strings.Join(allColumns, ", ")
-	placeholders := strings.Repeat("?,", len(allColumns))
-	placeholders = placeholders[:len(placeholders)-1] // Remove last comma
 
 	// Build SELECT query to get data from source database
 	whereClause := ""
 	var args []interface{}
 
-	if clusteredColumns == "_tidb_rowid" {
+	if sqlCache.ClusteredColumns == "_tidb_rowid" {
 		// For tables without clustered index, use _tidb_rowid
-		whereClause = fmt.Sprintf("WHERE %s >= ? AND %s < ?", clusteredColumns, clusteredColumns)
+		whereClause = fmt.Sprintf("WHERE %s >= ? AND %s < ?", sqlCache.ClusteredColumns, sqlCache.ClusteredColumns)
 		args = append(args, task.PageInfo.StartKey, task.PageInfo.EndKey)
 	} else {
 		// For tables with clustered index, handle potentially composite keys
-		columns := strings.Split(clusteredColumns, ",")
+		columns := strings.Split(sqlCache.ClusteredColumns, ",")
 		if len(columns) == 1 {
 			// Single column clustered index
 			whereClause = fmt.Sprintf("WHERE %s >= ? AND %s < ?", strings.TrimSpace(columns[0]), strings.TrimSpace(columns[0]))
@@ -351,9 +352,9 @@ func (m *ImportManager) processImportTask(task ImportTask) {
 		}
 	}
 
-	selectSQL := fmt.Sprintf("SELECT %s FROM %s.%s %s ORDER BY %s",
-		columnList, task.Database, task.Table, whereClause, clusteredColumns)
+	selectSQL := fmt.Sprintf(sqlCache.SelectTemplate, whereClause)
 
+	start := time.Now()
 	// Execute SELECT query on source database
 	rows, err := m.sourceDB.Query(selectSQL, args...)
 	if err != nil {
@@ -361,14 +362,16 @@ func (m *ImportManager) processImportTask(task ImportTask) {
 		m.markImportPageAsFailed(task.Database, task.Table, task.PageInfo.ID, fmt.Sprintf("Failed to select data: %v", err))
 		return
 	}
+	elapsed := time.Since(start)
+	log.Printf("Time taken to select data: %v", elapsed)
 	defer rows.Close()
 
 	// Prepare data for batch insert
 	var batchData [][]interface{}
 	for rows.Next() {
 		// Create a slice to hold all column values
-		columnValues := make([]interface{}, len(allColumns))
-		columnPointers := make([]interface{}, len(allColumns))
+		columnValues := make([]interface{}, len(sqlCache.AllColumns))
+		columnPointers := make([]interface{}, len(sqlCache.AllColumns))
 
 		// Create pointers to the column values
 		for i := range columnValues {
@@ -397,48 +400,43 @@ func (m *ImportManager) processImportTask(task ImportTask) {
 		return
 	}
 
-	// Insert data into destination database
-	insertSQL := fmt.Sprintf("INSERT INTO %s.%s (%s) VALUES (%s)",
-		dstDbConfig.Database, task.Table, columnList, placeholders)
-
-	// Use transaction for batch insert
-	tx, err := m.destDB.Begin()
-	if err != nil {
-		log.Printf("Error beginning transaction for table %s.%s: %v", task.Database, task.Table, err)
-		m.markImportPageAsFailed(task.Database, task.Table, task.PageInfo.ID, fmt.Sprintf("Failed to begin transaction: %v", err))
-		return
-	}
-	defer tx.Rollback()
-
-	stmt, err := tx.Prepare(insertSQL)
-	if err != nil {
-		log.Printf("Error preparing insert statement for table %s.%s: %v", task.Database, task.Table, err)
-		m.markImportPageAsFailed(task.Database, task.Table, task.PageInfo.ID, fmt.Sprintf("Failed to prepare insert: %v", err))
-		return
-	}
-	defer stmt.Close()
-
-	// Execute batch insert
+	start = time.Now()
+	// Insert data into destination database using direct batch insert
 	insertedRows := 0
-	for _, rowData := range batchData {
-		_, err := stmt.Exec(rowData...)
-		if err != nil {
-			// log.Printf("Error inserting row into table %s.%s: %v", task.Database, task.Table, err)
-			// Continue with other rows instead of failing the entire batch
-			continue
+	if len(batchData) > 0 {
+		// Build batch insert SQL with multiple VALUES
+		valuesClause := strings.Repeat("("+sqlCache.Placeholders+"),", len(batchData))
+		valuesClause = valuesClause[:len(valuesClause)-1] // Remove last comma
+
+		batchInsertSQL := fmt.Sprintf("INSERT INTO %s.%s (%s) VALUES %s",
+			dstDbConfig.Database, task.Table, sqlCache.ColumnList, valuesClause)
+
+		// Flatten all row data into a single slice
+		var allValues []interface{}
+		for _, rowData := range batchData {
+			allValues = append(allValues, rowData...)
 		}
-		insertedRows++
-	}
 
-	// Commit transaction
-	if err := tx.Commit(); err != nil {
-		log.Printf("Error committing transaction for table %s.%s: %v", task.Database, task.Table, err)
-		m.markImportPageAsFailed(task.Database, task.Table, task.PageInfo.ID, fmt.Sprintf("Failed to commit transaction: %v", err))
-		return
+		// Execute single batch insert directly
+		_, err := m.destDB.Exec(batchInsertSQL, allValues...)
+		if err != nil {
+			// Check if it's a duplicate key error
+			if strings.Contains(err.Error(), "Duplicate entry") || strings.Contains(err.Error(), "duplicate key") {
+				log.Printf("Warning: Duplicate key error for table %s.%s page %d: %v",
+					task.Database, task.Table, task.PageInfo.PageNum, err)
+				// Still mark as success since data already exists
+				insertedRows = len(batchData)
+			} else {
+				log.Printf("Error executing batch insert for table %s.%s: %v", task.Database, task.Table, err)
+				m.markImportPageAsFailed(task.Database, task.Table, task.PageInfo.ID, fmt.Sprintf("Failed to execute batch insert: %v", err))
+				return
+			}
+		} else {
+			insertedRows = len(batchData)
+		}
 	}
-
-	fmt.Printf("✅ Successfully imported %d/%d rows for page %d of table %s.%s\n",
-		insertedRows, len(batchData), task.PageInfo.PageNum, task.Database, task.Table)
+	elapsed = time.Since(start)
+	log.Printf("Time taken to insert data: %v", elapsed)
 
 	// Update row statistics
 	m.statsMutex.Lock()
@@ -447,33 +445,6 @@ func (m *ImportManager) processImportTask(task ImportTask) {
 
 	// Mark this page as successfully imported
 	m.markImportPageAsSuccess(task.Database, task.Table, task.PageInfo.ID)
-}
-
-// getDetailedProgress gets detailed progress information for export and import
-func (m *ImportManager) getDetailedProgress(database, table string) (*DetailedProgress, error) {
-	var progress DetailedProgress
-	err := m.sourceDB.QueryRow(`
-		SELECT 
-			page_number,
-			export_completed_pages, export_failed_pages, export_running_pages,
-			import_completed_pages, import_failed_pages, import_running_pages,
-			CASE 
-				WHEN page_number > 0 THEN (export_completed_pages * 100.0 / page_number)
-				ELSE 0 
-			END as export_completion_percentage,
-			CASE 
-				WHEN page_number > 0 THEN (import_completed_pages * 100.0 / page_number)
-				ELSE 0 
-			END as import_completion_percentage
-		FROM sitemerge.export_import_summary 
-		WHERE site_database = ? AND site_table = ?`,
-		database, table).Scan(
-		&progress.TotalPages,
-		&progress.ExportCompletedPages, &progress.ExportFailedPages, &progress.ExportRunningPages,
-		&progress.ImportCompletedPages, &progress.ImportFailedPages, &progress.ImportRunningPages,
-		&progress.ExportCompletionPercentage, &progress.ImportCompletionPercentage)
-
-	return &progress, err
 }
 
 // printImportProgress prints current import progress for all tables
@@ -603,6 +574,66 @@ func (m *ImportManager) getTableColumns(database, table string) ([]string, error
 	return columns, nil
 }
 
+// getTableSQLCache retrieves or creates cached SQL statements for a table
+func (m *ImportManager) getTableSQLCache(database, table string) (*TableSQLCache, error) {
+	cacheKey := fmt.Sprintf("%s.%s", database, table)
+
+	// Try to get from cache first (read lock)
+	m.sqlCacheMutex.RLock()
+	if cache, exists := m.sqlCache[cacheKey]; exists {
+		m.sqlCacheMutex.RUnlock()
+		return cache, nil
+	}
+	m.sqlCacheMutex.RUnlock()
+
+	// Cache miss, need to create new cache entry (write lock)
+	m.sqlCacheMutex.Lock()
+	defer m.sqlCacheMutex.Unlock()
+
+	// Double-check in case another goroutine created it while we were waiting
+	if cache, exists := m.sqlCache[cacheKey]; exists {
+		return cache, nil
+	}
+
+	// Get table structure information
+	clusteredColumns, err := m.getTableClusteredColumns(database, table)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get clustered columns: %w", err)
+	}
+
+	// Get all columns for the table
+	allColumns, err := m.getTableColumns(database, table)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get table columns: %w", err)
+	}
+
+	// Create column list and placeholders
+	columnList := strings.Join(allColumns, ", ")
+	placeholders := strings.Repeat("?,", len(allColumns))
+	placeholders = placeholders[:len(placeholders)-1] // Remove last comma
+
+	// Create SQL templates
+	selectTemplate := fmt.Sprintf("SELECT %s FROM %s.%s %%s ORDER BY %s",
+		columnList, database, table, clusteredColumns)
+	insertTemplate := fmt.Sprintf("INSERT INTO %s.%s (%s) VALUES (%s)",
+		"%s", table, columnList, placeholders) // %s will be replaced with destination database
+
+	// Create cache entry
+	cache := &TableSQLCache{
+		AllColumns:       allColumns,
+		ColumnList:       columnList,
+		Placeholders:     placeholders,
+		SelectTemplate:   selectTemplate,
+		InsertTemplate:   insertTemplate,
+		ClusteredColumns: clusteredColumns,
+	}
+
+	// Store in cache
+	m.sqlCache[cacheKey] = cache
+
+	return cache, nil
+}
+
 // markImportPageAsRunning marks a page import as running
 func (m *ImportManager) markImportPageAsRunning(database, table string, pageID int64) bool {
 	var running bool
@@ -617,6 +648,22 @@ func (m *ImportManager) markImportPageAsRunning(database, table string, pageID i
 	}
 
 	if running {
+		return false
+	}
+
+	// Also check if the page is already successfully imported
+	var success bool
+	err = m.sourceDB.QueryRow(`
+		SELECT COUNT(*) > 0 
+		FROM sitemerge.page_operation_status 
+		WHERE site_database = ? AND site_table = ? AND page_id = ? AND import_status = 'success'`,
+		database, table, pageID).Scan(&success)
+	if err != nil {
+		log.Printf("Error checking page success status: %v", err)
+		return false
+	}
+
+	if success {
 		return false
 	}
 
@@ -665,27 +712,40 @@ func (m *ImportManager) markImportPageAsSuccess(database, table string, pageID i
 		return
 	}
 
-	// Atomically update summary counters
+	// Count actual completed pages instead of using a counter
+	var completedPages, totalPages int64
+	err = tx.QueryRow(`
+		SELECT 
+			(SELECT COUNT(*) FROM sitemerge.page_operation_status 
+			 WHERE site_database = ? AND site_table = ? AND import_status = 'success'),
+			(SELECT COUNT(*) FROM sitemerge.page_info 
+			 WHERE site_database = ? AND site_table = ?)`,
+		database, table, database, table).Scan(&completedPages, &totalPages)
+
+	if err != nil {
+		log.Printf("Error counting pages: %v", err)
+		return
+	}
+
+	// Update summary with accurate counts
 	_, err = tx.Exec(`
 		UPDATE sitemerge.export_import_summary 
-		SET import_completed_pages = import_completed_pages + 1,
-			import_running_pages = import_running_pages - 1
+		SET import_completed_pages = ?,
+			page_number = ?,
+			import_running_pages = (
+				SELECT COUNT(*) FROM sitemerge.page_operation_status 
+				WHERE site_database = ? AND site_table = ? AND import_status = 'running'
+			)
 		WHERE site_database = ? AND site_table = ?`,
-		database, table)
+		completedPages, totalPages, database, table, database, table)
+
 	if err != nil {
-		log.Printf("Error updating summary counters: %v", err)
+		log.Printf("Error updating summary: %v", err)
 		return
 	}
 
 	// Check if import is completed for this table
-	var importCompletedPages, totalPages int64
-	err = tx.QueryRow(`
-		SELECT import_completed_pages, page_number 
-		FROM sitemerge.export_import_summary 
-		WHERE site_database = ? AND site_table = ?`,
-		database, table).Scan(&importCompletedPages, &totalPages)
-
-	if err == nil && importCompletedPages >= totalPages {
+	if completedPages >= totalPages {
 		// Mark entire table import as completed
 		_, err = tx.Exec(`
 			UPDATE sitemerge.export_import_summary 
@@ -694,7 +754,7 @@ func (m *ImportManager) markImportPageAsSuccess(database, table string, pageID i
 			database, table)
 		if err == nil {
 			fmt.Printf("🎉 Import completed for entire table %s.%s (%d/%d pages)\n",
-				database, table, importCompletedPages, totalPages)
+				database, table, completedPages, totalPages)
 		}
 	}
 
