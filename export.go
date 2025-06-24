@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -73,6 +74,10 @@ type ExportManager struct {
 	// Table tracking
 	tableStatus      map[string]*TableExportStatus
 	tableStatusMutex sync.RWMutex
+
+	// Tables to process
+	tablesToProcess    []string
+	tablesProcessMutex sync.RWMutex
 }
 
 // TableExportStatus tracks the export status of each table
@@ -117,6 +122,12 @@ func (m *ExportManager) CreateExportImportSummaryTable() error {
 			import_status ENUM('pending', 'running', 'success', 'failed') DEFAULT 'pending',
 			import_time DATETIME DEFAULT NULL,
 			import_error TEXT,
+
+			-- Page-level statistics
+			import_completed_pages BIGINT DEFAULT 0,
+			import_failed_pages BIGINT DEFAULT 0,
+			import_running_pages BIGINT DEFAULT 0,
+
 			UNIQUE KEY db_table (site_database, site_table)
 		);`
 
@@ -329,6 +340,9 @@ func (m *ExportManager) scheduleExportTasks() {
 	for _, t := range tables {
 		m.checkAndMarkTableCompleteIfNeeded(t.database, t.table)
 	}
+
+	// Check if all tables are completed and exit if so
+	m.checkAllTablesCompleteAndExit()
 }
 
 // getExportTasksForTable gets export tasks for a specific table
@@ -371,6 +385,49 @@ func (m *ExportManager) getExportTasksForTable(database, table string, maxTasks 
 	}
 
 	return tasks
+}
+
+// checkAllTablesCompleteAndExit checks if all tables are completed and exits if so
+func (m *ExportManager) checkAllTablesCompleteAndExit() {
+	// Get the tables to process
+	m.tablesProcessMutex.RLock()
+	tables := make([]string, len(m.tablesToProcess))
+	copy(tables, m.tablesToProcess)
+	m.tablesProcessMutex.RUnlock()
+
+	if len(tables) == 0 {
+		return
+	}
+
+	// Check if all tables are completed
+	var completedCount int
+	err := m.sourceDB.QueryRow(`
+		SELECT COUNT(*) 
+		FROM sitemerge.export_import_summary 
+		WHERE site_database = ? 
+		AND site_table IN (`+strings.Repeat("?,", len(tables)-1)+`?) 
+		AND export_status = 'success'`,
+		append([]interface{}{dbConfig.Database}, stringSliceToInterfaceSlice(tables)...)...).Scan(&completedCount)
+
+	if err != nil {
+		log.Printf("Error checking completed tables count: %v", err)
+		return
+	}
+
+	// If all tables are completed, initiate shutdown
+	if completedCount == len(tables) {
+		fmt.Printf("\n🎉 All %d tables have been successfully exported! Initiating shutdown...\n", len(tables))
+		m.cancel()
+	}
+}
+
+// stringSliceToInterfaceSlice converts []string to []interface{}
+func stringSliceToInterfaceSlice(slice []string) []interface{} {
+	result := make([]interface{}, len(slice))
+	for i, v := range slice {
+		result[i] = v
+	}
+	return result
 }
 
 // checkAndMarkTableCompleteIfNeeded checks if a table should be marked as complete
@@ -551,14 +608,41 @@ func (m *ExportManager) printExportStats() {
 
 	// Get pending pages count for debugging
 	var pendingPagesCount int
-	err = m.sourceDB.QueryRow(`
-		SELECT COUNT(*) 
-		FROM sitemerge.page_info pi
-		LEFT JOIN sitemerge.page_operation_status pos 
-			ON pi.site_database = pos.site_database 
-			AND pi.site_table = pos.site_table 
-			AND pi.id = pos.page_id
-		WHERE (pos.export_status IS NULL OR pos.export_status != 'success')`).Scan(&pendingPagesCount)
+
+	// Get the tables to process
+	m.tablesProcessMutex.RLock()
+	tables := make([]string, len(m.tablesToProcess))
+	copy(tables, m.tablesToProcess)
+	m.tablesProcessMutex.RUnlock()
+
+	if len(tables) > 0 {
+		// Create placeholders for IN clause
+		placeholders := make([]string, len(tables))
+		args := make([]interface{}, len(tables)+1)
+		args[0] = dbConfig.Database
+
+		for i, table := range tables {
+			placeholders[i] = "?"
+			args[i+1] = table
+		}
+
+		query := fmt.Sprintf(`
+			SELECT COUNT(*) 
+			FROM sitemerge.page_info pi
+			LEFT JOIN sitemerge.page_operation_status pos 
+				ON pi.site_database = pos.site_database 
+				AND pi.site_table = pos.site_table 
+				AND pi.id = pos.page_id
+			WHERE pi.site_database = ? 
+			AND pi.site_table IN (%s)
+			AND (pos.export_status IS NULL OR pos.export_status != 'success')`,
+			strings.Join(placeholders, ","))
+
+		err = m.sourceDB.QueryRow(query, args...).Scan(&pendingPagesCount)
+	} else {
+		pendingPagesCount = 0
+		err = nil
+	}
 
 	if err != nil {
 		log.Printf("Error getting pending pages count: %v", err)
@@ -585,6 +669,11 @@ func (m *ExportManager) Run() error {
 	if len(tables) == 0 {
 		return fmt.Errorf("no tables found to process")
 	}
+
+	// Store tables to process for statistics
+	m.tablesProcessMutex.Lock()
+	m.tablesToProcess = tables
+	m.tablesProcessMutex.Unlock()
 
 	// Initialize export_import_summary
 	if err := m.InitializeExportSummary(tables); err != nil {

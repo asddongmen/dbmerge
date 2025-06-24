@@ -69,82 +69,6 @@ func NewImportManager(sourceDB, destDB *sql.DB, threads int, tableName string) *
 	}
 }
 
-// CreateExportImportSummaryTable creates the export_import_summary table if it doesn't exist
-func (m *ImportManager) CreateExportImportSummaryTable() error {
-	// Create export_import_summary table
-	createSummaryTableSQL := `
-		CREATE TABLE IF NOT EXISTS sitemerge.export_import_summary (
-			task_id BIGINT AUTO_INCREMENT PRIMARY KEY,
-			site_database VARCHAR(255) NOT NULL,
-			site_table VARCHAR(255) NOT NULL,
-			total_count BIGINT DEFAULT 0,
-			export_count BIGINT DEFAULT 0,
-			last_success_end_key BIGINT DEFAULT NULL,
-			last_success_timestamp DATETIME DEFAULT NULL,
-			export_status ENUM('pending', 'running', 'success', 'failed') DEFAULT 'pending',
-			export_time DATETIME DEFAULT NULL,
-			export_error TEXT,
-			import_status ENUM('pending', 'running', 'success', 'failed') DEFAULT 'pending',
-			import_time DATETIME DEFAULT NULL,
-			import_error TEXT,
-			-- Page-level statistics
-			page_number BIGINT DEFAULT 0,
-			export_completed_pages BIGINT DEFAULT 0,
-			export_failed_pages BIGINT DEFAULT 0,
-			export_running_pages BIGINT DEFAULT 0,
-			import_completed_pages BIGINT DEFAULT 0,
-			import_failed_pages BIGINT DEFAULT 0,
-			import_running_pages BIGINT DEFAULT 0,
-			UNIQUE KEY db_table (site_database, site_table)
-		);`
-
-	_, err := m.sourceDB.Exec(createSummaryTableSQL)
-	if err != nil {
-		return fmt.Errorf("failed to create export_import_summary table: %w", err)
-	}
-
-	// Create page_operation_status table
-	createPageStatusTableSQL := `
-		CREATE TABLE IF NOT EXISTS sitemerge.page_operation_status (
-			id BIGINT AUTO_INCREMENT PRIMARY KEY,
-			site_database VARCHAR(255) NOT NULL,
-			site_table VARCHAR(255) NOT NULL,
-			page_id BIGINT NOT NULL,
-			page_num INT NOT NULL,
-			
-			-- Export related status
-			export_status ENUM('pending', 'running', 'success', 'failed') DEFAULT 'pending',
-			export_start_time DATETIME,
-			export_end_time DATETIME,
-			export_error TEXT,
-			export_retry_count INT DEFAULT 0,
-			
-			-- Import related status
-			import_status ENUM('pending', 'running', 'success', 'failed', 'skipped') DEFAULT 'pending',
-			import_start_time DATETIME,
-			import_end_time DATETIME,
-			import_error TEXT,
-			import_retry_count INT DEFAULT 0,
-			
-			-- Common fields
-			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-			
-			UNIQUE KEY uk_page (site_database, site_table, page_id),
-			INDEX idx_export_status (site_database, site_table, export_status),
-			INDEX idx_import_status (site_database, site_table, import_status),
-			INDEX idx_combined_status (site_database, site_table, export_status, import_status)
-		);`
-
-	_, err = m.sourceDB.Exec(createPageStatusTableSQL)
-	if err != nil {
-		return fmt.Errorf("failed to create page_operation_status table: %w", err)
-	}
-
-	fmt.Println("✅ Export/Import summary and page status tables created or already exist")
-	return nil
-}
-
 // GetTablesToProcess returns the list of tables to process for import
 func (m *ImportManager) GetTablesToProcess() ([]string, error) {
 	var tables []string
@@ -580,7 +504,7 @@ func (m *ImportManager) printImportProgress() {
 
 	rows, err := m.sourceDB.Query(query)
 	if err != nil {
-		log.Printf("Error querying import progress: %v", err)
+		log.Printf("	: %v", err)
 		return
 	}
 	defer rows.Close()
@@ -779,10 +703,6 @@ func (m *ImportManager) markImportPageAsSuccess(database, table string, pageID i
 
 // Run starts the import process
 func (m *ImportManager) Run() error {
-	// Create export_import_summary table
-	if err := m.CreateExportImportSummaryTable(); err != nil {
-		return err
-	}
 
 	// Get tables to process
 	tables, err := m.GetTablesToProcess()
