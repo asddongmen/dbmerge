@@ -88,7 +88,7 @@ func (m *ImportManager) CreateExportImportSummaryTable() error {
 			import_time DATETIME DEFAULT NULL,
 			import_error TEXT,
 			-- Page-level statistics
-			total_pages BIGINT DEFAULT 0,
+			page_number BIGINT DEFAULT 0,
 			export_completed_pages BIGINT DEFAULT 0,
 			export_failed_pages BIGINT DEFAULT 0,
 			export_running_pages BIGINT DEFAULT 0,
@@ -245,7 +245,7 @@ func (m *ImportManager) updateTotalPagesCount(database, table string) error {
 
 	_, err = m.sourceDB.Exec(`
 		UPDATE sitemerge.export_import_summary 
-		SET total_pages = ? 
+		SET page_number = ? 
 		WHERE site_database = ? AND site_table = ?`,
 		totalPages, database, table)
 
@@ -529,15 +529,15 @@ func (m *ImportManager) getDetailedProgress(database, table string) (*DetailedPr
 	var progress DetailedProgress
 	err := m.sourceDB.QueryRow(`
 		SELECT 
-			total_pages,
+			page_number,
 			export_completed_pages, export_failed_pages, export_running_pages,
 			import_completed_pages, import_failed_pages, import_running_pages,
 			CASE 
-				WHEN total_pages > 0 THEN (export_completed_pages * 100.0 / total_pages)
+				WHEN page_number > 0 THEN (export_completed_pages * 100.0 / page_number)
 				ELSE 0 
 			END as export_completion_percentage,
 			CASE 
-				WHEN total_pages > 0 THEN (import_completed_pages * 100.0 / total_pages)
+				WHEN page_number > 0 THEN (import_completed_pages * 100.0 / page_number)
 				ELSE 0 
 			END as import_completion_percentage
 		FROM sitemerge.export_import_summary 
@@ -572,7 +572,7 @@ func (m *ImportManager) printImportProgress() {
 
 	// Query table progress
 	query := `
-		SELECT site_database, site_table, total_pages, 
+		SELECT site_database, site_table, page_number, 
 			   import_completed_pages, import_failed_pages, import_running_pages
 		FROM sitemerge.export_import_summary 
 		WHERE import_status IN ('running', 'success')
@@ -754,7 +754,7 @@ func (m *ImportManager) markImportPageAsSuccess(database, table string, pageID i
 	// Check if import is completed for this table
 	var importCompletedPages, totalPages int64
 	err = tx.QueryRow(`
-		SELECT import_completed_pages, total_pages 
+		SELECT import_completed_pages, page_number 
 		FROM sitemerge.export_import_summary 
 		WHERE site_database = ? AND site_table = ?`,
 		database, table).Scan(&importCompletedPages, &totalPages)

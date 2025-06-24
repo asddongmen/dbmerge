@@ -12,12 +12,16 @@ import (
 	"time"
 )
 
-// ExportImportSummary represents the export/import status table
+// ExportImportSummary represents the export/import status table“
 type ExportImportSummary struct {
-	TaskID               int64      `db:"task_id"`
-	SiteDatabase         string     `db:"site_database"`
-	SiteTable            string     `db:"site_table"`
-	TotalCount           int64      `db:"total_count"`
+	TaskID       int64  `db:"task_id"`
+	SiteDatabase string `db:"site_database"`
+	SiteTable    string `db:"site_table"`
+	// Page number of the table
+	PageNumber int `db:"page_number"`
+	// Total row count of the table
+	TotalCount int64 `db:"total_count"`
+	// Exported row count of the table
 	ExportCount          int64      `db:"export_count"`
 	LastSuccessEndKey    *int64     `db:"last_success_end_key"`
 	LastSuccessTimestamp *time.Time `db:"last_success_timestamp"`
@@ -102,6 +106,7 @@ func (m *ExportManager) CreateExportImportSummaryTable() error {
 			task_id BIGINT AUTO_INCREMENT PRIMARY KEY,
 			site_database VARCHAR(255) NOT NULL,
 			site_table VARCHAR(255) NOT NULL,
+			page_number INT NOT NULL,
 			total_count BIGINT DEFAULT 0,
 			export_count BIGINT DEFAULT 0,
 			last_success_end_key BIGINT DEFAULT NULL,
@@ -216,13 +221,13 @@ func (m *ExportManager) InitializeExportSummary(tables []string) error {
 		// Insert or update the record
 		insertSQL := `
 			INSERT INTO sitemerge.export_import_summary 
-			(site_database, site_table, total_count, export_status, import_status)
-			VALUES (?, ?, ?, 'pending', 'pending')
+			(site_database, site_table, page_number, total_count, export_status, import_status)
+			VALUES (?, ?, ?, ?, 'pending', 'pending')
 			ON DUPLICATE KEY UPDATE 
 			total_count = VALUES(total_count),
 			export_status = 'pending'`
 
-		_, err = m.sourceDB.Exec(insertSQL, dbConfig.Database, table, totalCount)
+		_, err = m.sourceDB.Exec(insertSQL, dbConfig.Database, table, 0, totalCount)
 		if err != nil {
 			return fmt.Errorf("failed to initialize export_import_summary for table %s: %w", table, err)
 		}
@@ -314,24 +319,10 @@ func (m *ExportManager) scheduleExportTasks() {
 
 		scheduledForTable := 0
 		for _, task := range tasks {
-			select {
-			case m.exportTaskChan <- task:
-				scheduledForTable++
-				totalScheduled++
-			default:
-				// Channel full, stop scheduling
-				goto done
-			}
+			m.exportTaskChan <- task
+			scheduledForTable++
+			totalScheduled++
 		}
-
-		if scheduledForTable > 0 {
-			log.Printf("📋 Scheduled %d tasks for table %s.%s", scheduledForTable, t.database, t.table)
-		}
-	}
-
-done:
-	if totalScheduled > 0 {
-		log.Printf("📋 Total scheduled %d export tasks from %d tables", totalScheduled, len(selectedTables))
 	}
 
 	// Check completion for all running tables
@@ -455,18 +446,15 @@ func (m *ExportManager) processExportTask(task ExportTask) {
 	// fmt.Printf("🔄 Exporting %s.%s page %d (keys: %d-%d)\n",
 	// 	task.Database, task.Table, task.PageInfo.PageNum, task.PageInfo.StartKey, task.PageInfo.EndKey)
 
-	// Simulate processing time
-	// time.Sleep(10 * time.Millisecond)
-
 	// Calculate exported rows (using page size as approximation)
 	exportedRows := int64(task.PageInfo.PageSize)
 
 	// Mark export page as success and update statistics
-	m.markExportPageAsSuccess(task.Database, task.Table, task.PageInfo.ID, exportedRows)
+	m.markExportPageAsSuccess(task.Database, task.Table, task.PageInfo, exportedRows)
 }
 
 // markExportPageAsSuccess marks a page export as successful
-func (m *ExportManager) markExportPageAsSuccess(database, table string, pageID int64, exportedRows int64) {
+func (m *ExportManager) markExportPageAsSuccess(database, table string, pageInfo PageInfo, exportedRows int64) {
 	tx, err := m.sourceDB.Begin()
 	if err != nil {
 		log.Printf("Error beginning transaction: %v", err)
@@ -479,7 +467,7 @@ func (m *ExportManager) markExportPageAsSuccess(database, table string, pageID i
 		UPDATE sitemerge.page_operation_status 
 		SET export_status = 'success', export_end_time = NOW()
 		WHERE site_database = ? AND site_table = ? AND page_id = ?`,
-		database, table, pageID)
+		database, table, pageInfo.ID)
 	if err != nil {
 		log.Printf("Error updating page status: %v", err)
 		return
@@ -488,41 +476,15 @@ func (m *ExportManager) markExportPageAsSuccess(database, table string, pageID i
 	// Atomically update summary counters
 	_, err = tx.Exec(`
 		UPDATE sitemerge.export_import_summary 
-		SET export_count = export_count + 1,
-			last_success_end_key = (SELECT end_key FROM sitemerge.page_info WHERE id = ?),
+		SET export_count = export_count + ?,
+			page_number = page_number + 1,
+			last_success_end_key = ?,
 			last_success_timestamp = NOW()
-		WHERE site_database = ? AND site_table = ?`,
-		pageID, database, table)
+		WHERE site_database = ? AND site_table = ?`, pageInfo.PageSize,
+		pageInfo.EndKey, database, table)
 	if err != nil {
 		log.Printf("Error updating summary counters: %v", err)
 		return
-	}
-
-	// Check if export is completed for this table
-	var exportCount, totalCount int64
-	err = tx.QueryRow(`
-		SELECT export_count, total_count 
-		FROM sitemerge.export_import_summary 
-		WHERE site_database = ? AND site_table = ?`,
-		database, table).Scan(&exportCount, &totalCount)
-
-	if err == nil && exportCount >= totalCount {
-		// Mark entire table export as completed
-		_, err = tx.Exec(`
-			UPDATE sitemerge.export_import_summary 
-			SET export_status = 'success', export_time = NOW()
-			WHERE site_database = ? AND site_table = ?`,
-			database, table)
-		if err == nil {
-			fmt.Printf("🎉 Export completed for entire table %s.%s (%d/%d pages)\n",
-				database, table, exportCount, totalCount)
-
-			// Update completed tables tracking
-			tableKey := fmt.Sprintf("%s.%s", database, table)
-			m.statsMutex.Lock()
-			m.completedTables[tableKey] = true
-			m.statsMutex.Unlock()
-		}
 	}
 
 	if err := tx.Commit(); err != nil {
