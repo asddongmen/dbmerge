@@ -98,12 +98,6 @@ func init() {
 	pageInfoCmd.Flags().IntVar(&pageSize, "page-size", 500, "Number of rows per page")
 	pageInfoCmd.Flags().IntVar(&threads, "threads", 1, "Number of worker threads (1-512, default: 1)")
 
-	// Export command flags
-	// exportCmd.Flags().StringVar(&dstDbConfig.Host, "dst-host", "", "Destination TiDB host address (required)")
-	// exportCmd.Flags().IntVar(&dstDbConfig.Port, "dst-port", 4000, "Destination TiDB port number")
-	// exportCmd.Flags().StringVar(&dstDbConfig.User, "dst-user", "", "Destination TiDB username (required)")
-	// exportCmd.Flags().StringVar(&dstDbConfig.Password, "dst-password", "", "Destination TiDB password (required)")
-	// exportCmd.Flags().StringVar(&dstDbConfig.Database, "dst-database", "", "Destination database name (required)")
 	exportCmd.Flags().IntVar(&threads, "threads", 8, "Number of worker threads (1-512, default: 8)")
 	exportCmd.Flags().StringVar(&tableName, "table-name", "", "Specific table name to process (default: all tables)")
 

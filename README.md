@@ -1,6 +1,6 @@
 # SiteMerge - TiDB Table Management Tool
 
-SiteMerge is a powerful command-line tool written in Go that provides comprehensive table management capabilities for TiDB databases. It offers two main functionalities: collecting table index information from target databases and generating pagination information for efficient data processing.
+SiteMerge is a powerful command-line tool written in Go that provides comprehensive table management capabilities for TiDB databases. It offers four main functionalities: collecting table index information from target databases, generating pagination information for efficient data processing, exporting data from TiDB databases, and importing data to TiDB databases.
 
 ## Features
 
@@ -18,6 +18,23 @@ SiteMerge is a powerful command-line tool written in Go that provides comprehens
 - Configurable page sizes for optimal performance
 - Progress tracking with status updates
 - Automatic handling of clustered and non-clustered indexes
+
+### 📤 Data Export (`export` command)
+- Exports data from TiDB database using page-based processing
+- Reads page_info for efficient sharding and parallel processing
+- Maintains export status in the sitemerge.export_import_summary table
+- Supports resume capability for interrupted exports
+- Configurable thread count for parallel processing
+- Option to export specific tables or all tables
+
+### 📥 Data Import (`import` command)
+- Imports data to TiDB database using page-based processing
+- Reads page_info for efficient sharding and parallel processing
+- Maintains import status in the sitemerge.export_import_summary table
+- Supports resume capability for interrupted imports
+- Configurable thread count for parallel processing
+- Option to import specific tables or all tables
+- Connects to both source and destination databases
 
 ## Installation
 
@@ -87,6 +104,7 @@ Generates pagination information for efficient data processing:
 
 #### Options:
 - `--page-size int`: Number of rows per page (default: 500)
+- `--threads int`: Number of worker threads (1-512, default: 1)
 
 #### What it does:
 1. Reads table information from `sitemerge.sitemerge_table_index_info`
@@ -97,6 +115,57 @@ Generates pagination information for efficient data processing:
    - Creates page records with start/end keys
    - Tracks progress for resume capability
 4. Supports automatic resume if interrupted
+
+### Command 3: Data Export
+
+Exports data from TiDB database using page-based processing:
+
+```bash
+./sitemerge export --host 127.0.0.1 --port 4000 --user root --password mypass --database mydb
+```
+
+#### Options:
+- `--threads int`: Number of worker threads (1-512, default: 8)
+- `--table-name string`: Specific table name to process (default: all tables)
+
+#### What it does:
+1. Reads page information from `sitemerge.page_info`
+2. Creates `sitemerge.export_import_summary` table for tracking export status
+3. For each table (or specific table if specified):
+   - Processes data in parallel using multiple threads
+   - Exports data based on page boundaries
+   - Maintains export progress and status
+   - Supports resume capability for interrupted exports
+4. Provides detailed progress reporting
+
+### Command 4: Data Import
+
+Imports data to TiDB database using page-based processing:
+
+```bash
+./sitemerge import --host 127.0.0.1 --port 4000 --user root --password mypass --database sourcedb \
+  --dst-host 127.0.0.1 --dst-port 4000 --dst-user root --dst-password mypass --dst-database destdb
+```
+
+#### Options:
+- `--threads int`: Number of worker threads (1-512, default: 8)
+- `--table-name string`: Specific table name to process (default: all tables)
+- `--dst-host string`: Destination TiDB host address (required)
+- `--dst-port int`: Destination TiDB port number (default: 4000)
+- `--dst-user string`: Destination TiDB username (required)
+- `--dst-password string`: Destination TiDB password (required)
+- `--dst-database string`: Destination database name (required)
+
+#### What it does:
+1. Connects to both source and destination databases
+2. Reads page information from `sitemerge.page_info`
+3. Creates `sitemerge.export_import_summary` table for tracking import status
+4. For each table (or specific table if specified):
+   - Processes data in parallel using multiple threads
+   - Imports data based on page boundaries
+   - Maintains import progress and status
+   - Supports resume capability for interrupted imports
+5. Provides detailed progress reporting
 
 ## Database Schema
 
@@ -148,6 +217,25 @@ CREATE TABLE sitemerge.page_info_progress (
 );
 ```
 
+### sitemerge.export_import_summary
+Tracks export and import operations:
+```sql
+CREATE TABLE sitemerge.export_import_summary (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    site_database VARCHAR(255),
+    site_table VARCHAR(255),
+    operation_type ENUM('export', 'import') NOT NULL,
+    status ENUM('processing', 'completed', 'failed') DEFAULT 'processing',
+    total_pages INT DEFAULT 0,
+    processed_pages INT DEFAULT 0,
+    total_rows BIGINT DEFAULT 0,
+    processed_rows BIGINT DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY site_table_operation(site_database, site_table, operation_type)
+);
+```
+
 ## Examples
 
 ### Complete Workflow
@@ -167,16 +255,80 @@ CREATE TABLE sitemerge.page_info_progress (
   --user root \
   --password mypassword \
   --database production_db \
-  --page-size 1000
+  --page-size 1000 \
+  --threads 4
+
+# Step 3: Export data from source database
+./sitemerge export \
+  --host 127.0.0.1 \
+  --port 4000 \
+  --user root \
+  --password mypassword \
+  --database production_db \
+  --threads 8
+
+# Step 4: Import data to destination database
+./sitemerge import \
+  --host 127.0.0.1 \
+  --port 4000 \
+  --user root \
+  --password mypassword \
+  --database production_db \
+  --dst-host 127.0.0.1 \
+  --dst-port 4000 \
+  --dst-user root \
+  --dst-password mypassword \
+  --dst-database staging_db \
+  --threads 8
+```
+
+### Export/Import Specific Tables
+```bash
+# Export only specific table
+./sitemerge export \
+  --host 127.0.0.1 \
+  --port 4000 \
+  --user root \
+  --password mypass \
+  --database mydb \
+  --table-name users \
+  --threads 16
+
+# Import only specific table
+./sitemerge import \
+  --host 127.0.0.1 \
+  --port 4000 \
+  --user root \
+  --password mypass \
+  --database sourcedb \
+  --dst-host 127.0.0.1 \
+  --dst-port 4000 \
+  --dst-user root \
+  --dst-password mypass \
+  --dst-database destdb \
+  --table-name users \
+  --threads 16
 ```
 
 ### Resume Interrupted Processing
-If the page-info command is interrupted, simply run it again - it will automatically resume from where it left off:
+If any command is interrupted, simply run it again - it will automatically resume from where it left off:
 
 ```bash
+# Resume interrupted page-info generation
 ./sitemerge page-info --host 127.0.0.1 --port 4000 --user root --password mypass --database mydb
 # Output: 🔄 Found interrupted processing for table `mydb`.`large_table`
 # Output: 📍 Resuming from key 150000 with 75000 rows already processed
+
+# Resume interrupted export
+./sitemerge export --host 127.0.0.1 --port 4000 --user root --password mypass --database mydb
+# Output: 🔄 Found interrupted export for table `mydb`.`users`
+# Output: 📍 Resuming from page 45 with 22500 rows already exported
+
+# Resume interrupted import
+./sitemerge import --host 127.0.0.1 --port 4000 --user root --password mypass --database sourcedb \
+  --dst-host 127.0.0.1 --dst-port 4000 --dst-user root --dst-password mypass --dst-database destdb
+# Output: 🔄 Found interrupted import for table `sourcedb`.`users`
+# Output: 📍 Resuming from page 45 with 22500 rows already imported
 ```
 
 ## Performance Considerations
@@ -201,6 +353,8 @@ The tool provides comprehensive error handling:
 This Go implementation replaces the original Python scripts:
 - `generate_table_index_info.py` → `sitemerge table-index`
 - `generate_page_info.py` → `sitemerge page-info`
+- `export_data.py` → `sitemerge export`
+- `import_data.py` → `sitemerge import`
 
 ### Key Improvements:
 - **Performance**: Native Go performance vs Python
@@ -208,6 +362,8 @@ This Go implementation replaces the original Python scripts:
 - **Better Error Handling**: Comprehensive error reporting
 - **Improved CLI**: Modern CLI interface with Cobra
 - **Enhanced Resume**: More robust resume capability
+- **Parallel Processing**: Multi-threaded export/import operations
+- **Unified Interface**: Single tool for all operations
 
 ## Contributing
 
