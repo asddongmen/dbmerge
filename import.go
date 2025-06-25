@@ -334,27 +334,27 @@ func (m *ImportManager) processImportTask(task ImportTask) {
 
 	if sqlCache.ClusteredColumns == "_tidb_rowid" {
 		// For tables without clustered index, use _tidb_rowid
-		whereClause = fmt.Sprintf("WHERE %s >= ? AND %s < ?", sqlCache.ClusteredColumns, sqlCache.ClusteredColumns)
+		whereClause = fmt.Sprintf("WHERE %s >= ? AND %s <= ?", sqlCache.ClusteredColumns, sqlCache.ClusteredColumns)
 		args = append(args, task.PageInfo.StartKey, task.PageInfo.EndKey)
 	} else {
 		// For tables with clustered index, handle potentially composite keys
 		columns := strings.Split(sqlCache.ClusteredColumns, ",")
 		if len(columns) == 1 {
 			// Single column clustered index
-			whereClause = fmt.Sprintf("WHERE %s >= ? AND %s < ?", strings.TrimSpace(columns[0]), strings.TrimSpace(columns[0]))
+			whereClause = fmt.Sprintf("WHERE %s >= ? AND %s <= ?", strings.TrimSpace(columns[0]), strings.TrimSpace(columns[0]))
 			args = append(args, task.PageInfo.StartKey, task.PageInfo.EndKey)
 		} else {
 			// For composite keys, we use the first column for range filtering
 			// This is a simplified approach - in reality, composite key handling would be more complex
 			firstColumn := strings.TrimSpace(columns[0])
-			whereClause = fmt.Sprintf("WHERE %s >= ? AND %s < ?", firstColumn, firstColumn)
+			whereClause = fmt.Sprintf("WHERE %s >= ? AND %s <= ?", firstColumn, firstColumn)
 			args = append(args, task.PageInfo.StartKey, task.PageInfo.EndKey)
 		}
 	}
 
 	selectSQL := fmt.Sprintf(sqlCache.SelectTemplate, whereClause)
 
-	start := time.Now()
+	//start := time.Now()
 	// Execute SELECT query on source database
 	rows, err := m.sourceDB.Query(selectSQL, args...)
 	if err != nil {
@@ -362,8 +362,8 @@ func (m *ImportManager) processImportTask(task ImportTask) {
 		m.markImportPageAsFailed(task.Database, task.Table, task.PageInfo.ID, fmt.Sprintf("Failed to select data: %v", err))
 		return
 	}
-	elapsed := time.Since(start)
-	log.Printf("Time taken to select data: %v", elapsed)
+	//elapsed := time.Since(start)
+	//log.Printf("Time taken to select data: %v", elapsed)
 	defer rows.Close()
 
 	// Prepare data for batch insert
@@ -400,7 +400,7 @@ func (m *ImportManager) processImportTask(task ImportTask) {
 		return
 	}
 
-	start = time.Now()
+	//start = time.Now()
 	// Insert data into destination database using direct batch insert
 	insertedRows := 0
 	if len(batchData) > 0 {
@@ -435,8 +435,8 @@ func (m *ImportManager) processImportTask(task ImportTask) {
 			insertedRows = len(batchData)
 		}
 	}
-	elapsed = time.Since(start)
-	log.Printf("Time taken to insert data: %v", elapsed)
+	//elapsed = time.Since(start)
+	//log.Printf("Time taken to insert data: %v", elapsed)
 
 	// Update row statistics
 	m.statsMutex.Lock()

@@ -42,9 +42,7 @@ CREATE TABLE IF NOT EXISTS sitemerge.page_info_progress (
 )`
 
 	getTablesSQL = `
-SELECT site_database, site_table, clustered_columns, table_rows
-FROM sitemerge.sitemerge_table_index_info
-ORDER BY site_database, site_table`
+SELECT site_database, site_table, clustered_columns, table_rows FROM sitemerge.sitemerge_table_index_info WHERE site_database = ? ORDER BY site_database, site_table;`
 )
 
 // TableToProcess represents a table that needs page info generation
@@ -89,9 +87,10 @@ type TaskResult struct {
 
 // PageInfoGenerator manages page information generation with multi-threading support
 type PageInfoGenerator struct {
-	db       *sql.DB
-	pageSize int
-	threads  int
+	db           *sql.DB
+	pageSize     int
+	threads      int
+	databaseName string
 	// Statistics tracking
 	mu              sync.Mutex
 	processedTables int
@@ -106,11 +105,12 @@ type PageInfoGenerator struct {
 }
 
 // NewPageInfoGenerator creates a new page info generator
-func NewPageInfoGenerator(db *sql.DB, pageSize int, threads int) *PageInfoGenerator {
+func NewPageInfoGenerator(db *sql.DB, pageSize int, threads int, databaseName string) *PageInfoGenerator {
 	return &PageInfoGenerator{
 		db:            db,
 		pageSize:      pageSize,
 		threads:       threads,
+		databaseName:  databaseName,
 		currentTables: make(map[int]string),
 		stopStatsChan: make(chan bool),
 	}
@@ -398,7 +398,8 @@ func (p *PageInfoGenerator) createPageInfoTables() error {
 }
 
 func (p *PageInfoGenerator) getTablesToProcess() ([]TableToProcess, error) {
-	rows, err := p.db.Query(getTablesSQL)
+	log.Printf("Getting tables to process for database: %s, sql: %s", p.databaseName, getTablesSQL)
+	rows, err := p.db.Query(getTablesSQL, p.databaseName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query tables: %w", err)
 	}
@@ -492,13 +493,13 @@ SELECT p.site_database, p.site_table, s.clustered_columns,
        s.table_rows, p.last_end_key, p.processed_rows
 FROM sitemerge.page_info_progress p
 JOIN sitemerge.sitemerge_table_index_info s ON p.site_database = s.site_database AND p.site_table = s.site_table
-WHERE p.status = 'processing'
+WHERE p.status = 'processing' AND p.site_database = ?
 ORDER BY p.updated_at ASC
 LIMIT 1`
 
 	var resumePoint ResumePoint
 	var tableRows sql.NullInt64
-	err := p.db.QueryRow(query).Scan(
+	err := p.db.QueryRow(query, p.databaseName).Scan(
 		&resumePoint.SiteDatabase,
 		&resumePoint.SiteTable,
 		&resumePoint.ClusteredColumns,
@@ -693,10 +694,12 @@ func (p *PageInfoGenerator) processSingleTable(resumePoint ResumePoint, isResume
 			actualPageSize := len(pageChunk)
 
 			pageData = append(pageData, PageInfo{
-				PageNum:  pageNum,
-				StartKey: startKey,
-				EndKey:   endKey,
-				PageSize: actualPageSize,
+				SiteDatabase: dbName,
+				SiteTable:    tableName,
+				PageNum:      pageNum,
+				StartKey:     startKey,
+				EndKey:       endKey,
+				PageSize:     actualPageSize,
 			})
 		}
 
@@ -722,6 +725,11 @@ func (p *PageInfoGenerator) processSingleTable(resumePoint ResumePoint, isResume
 func (p *PageInfoGenerator) generatePageInfoBatch(dbName, tableName, divideColumn string,
 	lastMaxID *int64) ([]int64, int64, error) {
 
+	// Handle multi-column clustered indexes by using only the first column
+	// Split by comma and take the first column
+	columns := strings.Split(divideColumn, ",")
+	firstColumn := strings.TrimSpace(columns[0])
+
 	var sqlTemplate string
 	var args []interface{}
 
@@ -731,7 +739,7 @@ func (p *PageInfoGenerator) generatePageInfoBatch(dbName, tableName, divideColum
 SELECT /*+ READ_FROM_STORAGE(TIKV) */ %s
 FROM %s.%s
 ORDER BY %s
-LIMIT %d`, divideColumn, dbName, tableName, divideColumn, batchSize)
+LIMIT %d`, firstColumn, dbName, tableName, firstColumn, batchSize)
 	} else {
 		// Subsequent batches - with WHERE condition
 		sqlTemplate = fmt.Sprintf(`
@@ -739,7 +747,7 @@ SELECT /*+ READ_FROM_STORAGE(TIKV) */ %s
 FROM %s.%s
 WHERE %s > ?
 ORDER BY %s
-LIMIT %d`, divideColumn, dbName, tableName, divideColumn, divideColumn, batchSize)
+LIMIT %d`, firstColumn, dbName, tableName, firstColumn, firstColumn, batchSize)
 		args = append(args, *lastMaxID)
 	}
 

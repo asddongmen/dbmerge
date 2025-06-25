@@ -117,7 +117,7 @@ func TestFilterRemainingTables(t *testing.T) {
 			tt.mockSetup(mock)
 
 			// Create PageInfoGenerator
-			generator := NewPageInfoGenerator(db, 1000, 4)
+			generator := NewPageInfoGenerator(db, 1000, 4, "test")
 
 			// Capture log output
 			var logOutput strings.Builder
@@ -202,7 +202,7 @@ func TestCheckTableExists(t *testing.T) {
 			tt.mockSetup(mock)
 
 			// Create PageInfoGenerator
-			generator := NewPageInfoGenerator(db, 1000, 4)
+			generator := NewPageInfoGenerator(db, 1000, 4, "test")
 
 			// Call the function under test
 			result, err := generator.CheckTableExists(tt.database, tt.table)
@@ -299,7 +299,7 @@ func TestDiagnoseTable(t *testing.T) {
 			tt.mockSetup(mock)
 
 			// Create PageInfoGenerator
-			generator := NewPageInfoGenerator(db, 1000, 4)
+			generator := NewPageInfoGenerator(db, 1000, 4, "test")
 
 			// Capture log output
 			var logOutput strings.Builder
@@ -397,7 +397,7 @@ func TestPrintAndSortTablesByDatabase(t *testing.T) {
 			mock.ExpectQuery("SELECT site_database, site_table, clustered_columns, table_rows").WillReturnRows(rows)
 
 			// Create PageInfoGenerator
-			generator := NewPageInfoGenerator(db, 1000, 10)
+			generator := NewPageInfoGenerator(db, 1000, 10, "test")
 
 			// Capture log output
 			var logOutput strings.Builder
@@ -485,4 +485,478 @@ func TestDatabaseTableStatsStructure(t *testing.T) {
 	assert.Equal(t, 2, len(stats.Tables))
 	assert.Equal(t, 2, stats.TotalCount)
 	assert.Equal(t, int64(300), stats.TotalRows)
+}
+
+func TestProcessSingleTable(t *testing.T) {
+	tests := []struct {
+		name           string
+		resumePoint    ResumePoint
+		isResume       bool
+		pageSize       int
+		mockSetup      func(mock sqlmock.Sqlmock)
+		expectedPages  int
+		expectedError  bool
+		expectedStatus string
+	}{
+		{
+			name: "New table processing - single batch",
+			resumePoint: ResumePoint{
+				SiteDatabase:     "test_db",
+				SiteTable:        "test_table",
+				ClusteredColumns: "id",
+				TableRows:        5000,
+				LastEndKey:       0,
+				ProcessedRows:    0,
+			},
+			isResume: false,
+			pageSize: 1000,
+			mockSetup: func(mock sqlmock.Sqlmock) {
+				// Clear existing page info
+				mock.ExpectExec("DELETE FROM sitemerge.page_info").
+					WithArgs("test_db", "test_table").
+					WillReturnResult(sqlmock.NewResult(0, 0))
+
+				// Update progress to processing
+				mock.ExpectExec("INSERT INTO sitemerge.page_info_progress").
+					WithArgs("test_db", "test_table", "processing", int64(0), int64(5000), int64(0)).
+					WillReturnResult(sqlmock.NewResult(0, 1))
+
+				// First batch query - no WHERE condition (10 rows, less than batchSize 10000)
+				rows := sqlmock.NewRows([]string{"id"}).
+					AddRow(1).AddRow(2).AddRow(3).AddRow(4).AddRow(5).
+					AddRow(6).AddRow(7).AddRow(8).AddRow(9).AddRow(10)
+				mock.ExpectQuery("SELECT /\\*\\+ READ_FROM_STORAGE\\(TIKV\\) \\*/ id").
+					WillReturnRows(rows)
+
+				// Update progress after first batch
+				mock.ExpectExec("INSERT INTO sitemerge.page_info_progress").
+					WithArgs("test_db", "test_table", "processing", int64(10), int64(5000), int64(10)).
+					WillReturnResult(sqlmock.NewResult(0, 1))
+
+				// Second batch query - empty result (since first batch < batchSize, loop continues)
+				emptyRows := sqlmock.NewRows([]string{"id"})
+				mock.ExpectQuery("SELECT /\\*\\+ READ_FROM_STORAGE\\(TIKV\\) \\*/ id").
+					WithArgs(int64(10)).
+					WillReturnRows(emptyRows)
+
+				// Insert page info batch - transaction operations
+				mock.ExpectBegin()
+				mock.ExpectPrepare("INSERT INTO sitemerge.page_info")
+				mock.ExpectExec("INSERT INTO sitemerge.page_info").
+					WithArgs("test_db", "test_table", 1, int64(1), int64(10), 10).
+					WillReturnResult(sqlmock.NewResult(0, 1))
+				mock.ExpectCommit()
+
+				// Mark as completed
+				mock.ExpectExec("INSERT INTO sitemerge.page_info_progress").
+					WithArgs("test_db", "test_table", "completed", int64(0), int64(5000), int64(10)).
+					WillReturnResult(sqlmock.NewResult(0, 1))
+			},
+			expectedPages:  1,
+			expectedError:  false,
+			expectedStatus: "completed",
+		},
+		{
+			name: "Resume table processing",
+			resumePoint: ResumePoint{
+				SiteDatabase:     "test_db",
+				SiteTable:        "test_table",
+				ClusteredColumns: "id",
+				TableRows:        10000,
+				LastEndKey:       1000,
+				ProcessedRows:    1000,
+			},
+			isResume: true,
+			pageSize: 1000,
+			mockSetup: func(mock sqlmock.Sqlmock) {
+				// Update progress to processing (resume)
+				mock.ExpectExec("INSERT INTO sitemerge.page_info_progress").
+					WithArgs("test_db", "test_table", "processing", int64(1000), int64(10000), int64(1000)).
+					WillReturnResult(sqlmock.NewResult(0, 1))
+
+				// Batch query with WHERE condition (resume from key 1000) - 5 rows, less than batchSize
+				rows := sqlmock.NewRows([]string{"id"}).
+					AddRow(1001).AddRow(1002).AddRow(1003).AddRow(1004).AddRow(1005)
+				mock.ExpectQuery("SELECT /\\*\\+ READ_FROM_STORAGE\\(TIKV\\) \\*/ id").
+					WithArgs(int64(1000)).
+					WillReturnRows(rows)
+
+				// Update progress after batch
+				mock.ExpectExec("INSERT INTO sitemerge.page_info_progress").
+					WithArgs("test_db", "test_table", "processing", int64(1005), int64(10000), int64(1005)).
+					WillReturnResult(sqlmock.NewResult(0, 1))
+
+				// Next batch - empty result (since first batch < batchSize, loop continues)
+				emptyRows := sqlmock.NewRows([]string{"id"})
+				mock.ExpectQuery("SELECT /\\*\\+ READ_FROM_STORAGE\\(TIKV\\) \\*/ id").
+					WithArgs(int64(1005)).
+					WillReturnRows(emptyRows)
+
+				// Insert page info batch (page 2 since we already processed 1000 rows) - transaction operations
+				mock.ExpectBegin()
+				mock.ExpectPrepare("INSERT INTO sitemerge.page_info")
+				mock.ExpectExec("INSERT INTO sitemerge.page_info").
+					WithArgs("test_db", "test_table", 2, int64(1001), int64(1005), 5).
+					WillReturnResult(sqlmock.NewResult(0, 1))
+				mock.ExpectCommit()
+
+				// Mark as completed
+				mock.ExpectExec("INSERT INTO sitemerge.page_info_progress").
+					WithArgs("test_db", "test_table", "completed", int64(0), int64(10000), int64(1005)).
+					WillReturnResult(sqlmock.NewResult(0, 1))
+			},
+			expectedPages:  1,
+			expectedError:  false,
+			expectedStatus: "completed",
+		},
+		{
+			name: "Multiple pages generation",
+			resumePoint: ResumePoint{
+				SiteDatabase:     "test_db",
+				SiteTable:        "test_table",
+				ClusteredColumns: "id",
+				TableRows:        5000,
+				LastEndKey:       0,
+				ProcessedRows:    0,
+			},
+			isResume: false,
+			pageSize: 1000,
+			mockSetup: func(mock sqlmock.Sqlmock) {
+				// Clear existing page info
+				mock.ExpectExec("DELETE FROM sitemerge.page_info").
+					WithArgs("test_db", "test_table").
+					WillReturnResult(sqlmock.NewResult(0, 0))
+
+				// Update progress to processing
+				mock.ExpectExec("INSERT INTO sitemerge.page_info_progress").
+					WithArgs("test_db", "test_table", "processing", int64(0), int64(5000), int64(0)).
+					WillReturnResult(sqlmock.NewResult(0, 1))
+
+				// First batch - 2500 rows (less than batchSize 10000, so loop continues)
+				rows1 := sqlmock.NewRows([]string{"id"})
+				for i := 1; i <= 2500; i++ {
+					rows1.AddRow(i)
+				}
+				mock.ExpectQuery("SELECT /\\*\\+ READ_FROM_STORAGE\\(TIKV\\) \\*/ id").
+					WillReturnRows(rows1)
+
+				// Update progress after first batch
+				mock.ExpectExec("INSERT INTO sitemerge.page_info_progress").
+					WithArgs("test_db", "test_table", "processing", int64(2500), int64(5000), int64(2500)).
+					WillReturnResult(sqlmock.NewResult(0, 1))
+
+				// Second batch - empty result (since first batch < batchSize, loop continues)
+				emptyRows := sqlmock.NewRows([]string{"id"})
+				mock.ExpectQuery("SELECT /\\*\\+ READ_FROM_STORAGE\\(TIKV\\) \\*/ id").
+					WithArgs(int64(2500)).
+					WillReturnRows(emptyRows)
+
+				// Insert page info batch - 3 pages (1000, 1000, 500) - transaction operations
+				mock.ExpectBegin()
+				mock.ExpectPrepare("INSERT INTO sitemerge.page_info")
+				mock.ExpectExec("INSERT INTO sitemerge.page_info").
+					WithArgs("test_db", "test_table", 1, int64(1), int64(1000), 1000).
+					WillReturnResult(sqlmock.NewResult(0, 1))
+				mock.ExpectExec("INSERT INTO sitemerge.page_info").
+					WithArgs("test_db", "test_table", 2, int64(1001), int64(2000), 1000).
+					WillReturnResult(sqlmock.NewResult(0, 1))
+				mock.ExpectExec("INSERT INTO sitemerge.page_info").
+					WithArgs("test_db", "test_table", 3, int64(2001), int64(2500), 500).
+					WillReturnResult(sqlmock.NewResult(0, 1))
+				mock.ExpectCommit()
+
+				// Mark as completed
+				mock.ExpectExec("INSERT INTO sitemerge.page_info_progress").
+					WithArgs("test_db", "test_table", "completed", int64(0), int64(5000), int64(2500)).
+					WillReturnResult(sqlmock.NewResult(0, 1))
+			},
+			expectedPages:  3,
+			expectedError:  false,
+			expectedStatus: "completed",
+		},
+		{
+			name: "Empty table",
+			resumePoint: ResumePoint{
+				SiteDatabase:     "test_db",
+				SiteTable:        "empty_table",
+				ClusteredColumns: "id",
+				TableRows:        0,
+				LastEndKey:       0,
+				ProcessedRows:    0,
+			},
+			isResume: false,
+			pageSize: 1000,
+			mockSetup: func(mock sqlmock.Sqlmock) {
+				// Clear existing page info
+				mock.ExpectExec("DELETE FROM sitemerge.page_info").
+					WithArgs("test_db", "empty_table").
+					WillReturnResult(sqlmock.NewResult(0, 0))
+
+				// Update progress to processing
+				mock.ExpectExec("INSERT INTO sitemerge.page_info_progress").
+					WithArgs("test_db", "empty_table", "processing", int64(0), int64(0), int64(0)).
+					WillReturnResult(sqlmock.NewResult(0, 1))
+
+				// First batch - empty result
+				emptyRows := sqlmock.NewRows([]string{"id"})
+				mock.ExpectQuery("SELECT /\\*\\+ READ_FROM_STORAGE\\(TIKV\\) \\*/ id").
+					WillReturnRows(emptyRows)
+
+				// Mark as completed (no pages to insert)
+				mock.ExpectExec("INSERT INTO sitemerge.page_info_progress").
+					WithArgs("test_db", "empty_table", "completed", int64(0), int64(0), int64(0)).
+					WillReturnResult(sqlmock.NewResult(0, 1))
+			},
+			expectedPages:  0,
+			expectedError:  false,
+			expectedStatus: "completed",
+		},
+		{
+			name: "Database error during batch query",
+			resumePoint: ResumePoint{
+				SiteDatabase:     "test_db",
+				SiteTable:        "error_table",
+				ClusteredColumns: "id",
+				TableRows:        1000,
+				LastEndKey:       0,
+				ProcessedRows:    0,
+			},
+			isResume: false,
+			pageSize: 1000,
+			mockSetup: func(mock sqlmock.Sqlmock) {
+				// Clear existing page info
+				mock.ExpectExec("DELETE FROM sitemerge.page_info").
+					WithArgs("test_db", "error_table").
+					WillReturnResult(sqlmock.NewResult(0, 0))
+
+				// Update progress to processing
+				mock.ExpectExec("INSERT INTO sitemerge.page_info_progress").
+					WithArgs("test_db", "error_table", "processing", int64(0), int64(1000), int64(0)).
+					WillReturnResult(sqlmock.NewResult(0, 1))
+
+				// Batch query fails
+				mock.ExpectQuery("SELECT /\\*\\+ READ_FROM_STORAGE\\(TIKV\\) \\*/ id").
+					WillReturnError(fmt.Errorf("database connection error"))
+
+				// Mark as failed
+				mock.ExpectExec("INSERT INTO sitemerge.page_info_progress").
+					WithArgs("test_db", "error_table", "failed", int64(0), int64(1000), int64(0)).
+					WillReturnResult(sqlmock.NewResult(0, 1))
+			},
+			expectedPages:  0,
+			expectedError:  true,
+			expectedStatus: "failed",
+		},
+		{
+			name: "Error during page info insertion",
+			resumePoint: ResumePoint{
+				SiteDatabase:     "test_db",
+				SiteTable:        "insert_error_table",
+				ClusteredColumns: "id",
+				TableRows:        1000,
+				LastEndKey:       0,
+				ProcessedRows:    0,
+			},
+			isResume: false,
+			pageSize: 1000,
+			mockSetup: func(mock sqlmock.Sqlmock) {
+				// Clear existing page info
+				mock.ExpectExec("DELETE FROM sitemerge.page_info").
+					WithArgs("test_db", "insert_error_table").
+					WillReturnResult(sqlmock.NewResult(0, 0))
+
+				// Update progress to processing
+				mock.ExpectExec("INSERT INTO sitemerge.page_info_progress").
+					WithArgs("test_db", "insert_error_table", "processing", int64(0), int64(1000), int64(0)).
+					WillReturnResult(sqlmock.NewResult(0, 1))
+
+				// First batch - some data (3 rows, less than batchSize)
+				rows := sqlmock.NewRows([]string{"id"}).
+					AddRow(1).AddRow(2).AddRow(3)
+				mock.ExpectQuery("SELECT /\\*\\+ READ_FROM_STORAGE\\(TIKV\\) \\*/ id").
+					WillReturnRows(rows)
+
+				// Update progress after first batch
+				mock.ExpectExec("INSERT INTO sitemerge.page_info_progress").
+					WithArgs("test_db", "insert_error_table", "processing", int64(3), int64(1000), int64(3)).
+					WillReturnResult(sqlmock.NewResult(0, 1))
+
+				// Second batch - empty result (since first batch < batchSize, loop continues)
+				emptyRows := sqlmock.NewRows([]string{"id"})
+				mock.ExpectQuery("SELECT /\\*\\+ READ_FROM_STORAGE\\(TIKV\\) \\*/ id").
+					WithArgs(int64(3)).
+					WillReturnRows(emptyRows)
+
+				// Insert page info batch fails
+				mock.ExpectBegin()
+				mock.ExpectPrepare("INSERT INTO sitemerge.page_info").
+					WillReturnError(fmt.Errorf("prepare statement error"))
+
+				// Mark as failed
+				mock.ExpectExec("INSERT INTO sitemerge.page_info_progress").
+					WithArgs("test_db", "insert_error_table", "failed", int64(0), int64(1000), int64(3)).
+					WillReturnResult(sqlmock.NewResult(0, 1))
+			},
+			expectedPages:  0,
+			expectedError:  true,
+			expectedStatus: "failed",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create mock database
+			db, mock, err := sqlmock.New()
+			require.NoError(t, err)
+			defer db.Close()
+
+			// Setup mock expectations
+			tt.mockSetup(mock)
+
+			// Create PageInfoGenerator
+			generator := NewPageInfoGenerator(db, tt.pageSize, 4, "test")
+
+			// Capture log output
+			var logOutput strings.Builder
+			log.SetOutput(&logOutput)
+			defer log.SetOutput(os.Stderr)
+
+			// Call the function under test
+			pagesCount, err := generator.processSingleTable(tt.resumePoint, tt.isResume)
+
+			// Verify the result
+			if tt.expectedError {
+				assert.Error(t, err, "Should return error")
+			} else {
+				assert.NoError(t, err, "Should not return error")
+			}
+
+			assert.Equal(t, tt.expectedPages, pagesCount, "Should return correct number of pages")
+
+			// Verify all mock expectations were met
+			assert.NoError(t, mock.ExpectationsWereMet(), "All database expectations should be met")
+
+			// Verify log output contains expected messages
+			logContent := logOutput.String()
+			if tt.isResume {
+				assert.Contains(t, logContent, "Resuming table", "Should log resume message")
+			} else {
+				assert.Contains(t, logContent, "Processing table", "Should log processing message")
+			}
+
+			if !tt.expectedError && tt.expectedPages > 0 {
+				assert.Contains(t, logContent, fmt.Sprintf("Generated %d pages", tt.expectedPages), "Should log pages generated")
+			}
+		})
+	}
+}
+
+func TestProcessSingleTableEdgeCases(t *testing.T) {
+	t.Run("Progress update error", func(t *testing.T) {
+		db, mock, err := sqlmock.New()
+		require.NoError(t, err)
+		defer db.Close()
+
+		resumePoint := ResumePoint{
+			SiteDatabase:     "test_db",
+			SiteTable:        "test_table",
+			ClusteredColumns: "id",
+			TableRows:        1000,
+			LastEndKey:       0,
+			ProcessedRows:    0,
+		}
+
+		// Clear existing page info (called when isResume is false)
+		mock.ExpectExec("DELETE FROM sitemerge.page_info").
+			WithArgs("test_db", "test_table").
+			WillReturnResult(sqlmock.NewResult(0, 0))
+
+		// Progress update fails
+		mock.ExpectExec("INSERT INTO sitemerge.page_info_progress").
+			WithArgs("test_db", "test_table", "processing", int64(0), int64(1000), int64(0)).
+			WillReturnError(fmt.Errorf("progress update error"))
+
+		generator := NewPageInfoGenerator(db, 1000, 4, "test")
+		pagesCount, err := generator.processSingleTable(resumePoint, false)
+
+		assert.Error(t, err, "Should return error")
+		assert.Equal(t, 0, pagesCount, "Should return 0 pages")
+		assert.Contains(t, err.Error(), "failed to update progress", "Error should mention progress update")
+		assert.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	t.Run("Clear existing page info error", func(t *testing.T) {
+		db, mock, err := sqlmock.New()
+		require.NoError(t, err)
+		defer db.Close()
+
+		resumePoint := ResumePoint{
+			SiteDatabase:     "test_db",
+			SiteTable:        "test_table",
+			ClusteredColumns: "id",
+			TableRows:        1000,
+			LastEndKey:       0,
+			ProcessedRows:    0,
+		}
+
+		// Clear existing page info fails
+		mock.ExpectExec("DELETE FROM sitemerge.page_info").
+			WithArgs("test_db", "test_table").
+			WillReturnError(fmt.Errorf("delete error"))
+
+		// Mark as failed
+		mock.ExpectExec("INSERT INTO sitemerge.page_info_progress").
+			WithArgs("test_db", "test_table", "failed", int64(0), int64(1000), int64(0)).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+
+		generator := NewPageInfoGenerator(db, 1000, 4, "test")
+		pagesCount, err := generator.processSingleTable(resumePoint, false)
+
+		assert.Error(t, err, "Should return error")
+		assert.Equal(t, 0, pagesCount, "Should return 0 pages")
+		assert.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	t.Run("Completion status update error", func(t *testing.T) {
+		db, mock, err := sqlmock.New()
+		require.NoError(t, err)
+		defer db.Close()
+
+		resumePoint := ResumePoint{
+			SiteDatabase:     "test_db",
+			SiteTable:        "test_table",
+			ClusteredColumns: "id",
+			TableRows:        1000,
+			LastEndKey:       0,
+			ProcessedRows:    0,
+		}
+
+		// Clear existing page info
+		mock.ExpectExec("DELETE FROM sitemerge.page_info").
+			WithArgs("test_db", "test_table").
+			WillReturnResult(sqlmock.NewResult(0, 0))
+
+		// Update progress to processing
+		mock.ExpectExec("INSERT INTO sitemerge.page_info_progress").
+			WithArgs("test_db", "test_table", "processing", int64(0), int64(1000), int64(0)).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+
+		// Empty batch
+		emptyRows := sqlmock.NewRows([]string{"id"})
+		mock.ExpectQuery("SELECT /\\*\\+ READ_FROM_STORAGE\\(TIKV\\) \\*/ id").
+			WillReturnRows(emptyRows)
+
+		// Completion status update fails
+		mock.ExpectExec("INSERT INTO sitemerge.page_info_progress").
+			WithArgs("test_db", "test_table", "completed", int64(0), int64(1000), int64(0)).
+			WillReturnError(fmt.Errorf("completion update error"))
+
+		generator := NewPageInfoGenerator(db, 1000, 4, "test")
+		pagesCount, err := generator.processSingleTable(resumePoint, false)
+
+		assert.Error(t, err, "Should return error")
+		assert.Equal(t, 0, pagesCount, "Should return 0 pages")
+		assert.Contains(t, err.Error(), "failed to mark as completed", "Error should mention completion")
+		assert.NoError(t, mock.ExpectationsWereMet())
+	})
 }

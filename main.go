@@ -201,7 +201,7 @@ func runPageInfo(cmd *cobra.Command, args []string) {
 	}
 	defer db.Close()
 
-	generator := NewPageInfoGenerator(db, pageSize, threads)
+	generator := NewPageInfoGenerator(db, pageSize, threads, dbConfig.Database)
 	if err := generator.Run(); err != nil {
 		log.Printf("❌ %v\n", err)
 		os.Exit(1)
