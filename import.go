@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -67,6 +68,7 @@ type ImportManager struct {
 	statsMutex        sync.RWMutex
 
 	skipCheckExportStatus bool
+	tableToProcess        []string
 }
 
 // NewImportManager creates a new import manager
@@ -92,7 +94,7 @@ func (m *ImportManager) GetTablesToProcess() ([]string, error) {
 	query := `
 	SELECT DISTINCT site_table 
 	FROM sitemerge.export_import_summary 
-	WHERE site_database = ?%s`
+	WHERE site_database = ? AND import_status != 'success' %s`
 
 	if m.skipCheckExportStatus {
 		query = fmt.Sprintf(query, "")
@@ -220,6 +222,9 @@ func (m *ImportManager) scheduleImportTasks() {
 	// First, reset any running tasks that have been stuck for too long
 	m.resetStuckImportTasks()
 
+	// DEBUG: Add logging to understand what's happening
+	log.Printf("DEBUG: Starting to schedule import tasks...")
+
 	// Get pending import tasks based on page status
 	tasks, err := m.getPendingImportTasks()
 	if err != nil {
@@ -227,13 +232,24 @@ func (m *ImportManager) scheduleImportTasks() {
 		return
 	}
 
+	// DEBUG: Log the number of tasks found
+	log.Printf("DEBUG: Found %d pending import tasks", len(tasks))
+
 	// Schedule tasks
+	scheduledCount := 0
 	for _, task := range tasks {
 		select {
 		case m.importTaskChan <- task:
+			scheduledCount++
 		case <-m.ctx.Done():
+			log.Printf("DEBUG: Context cancelled, stopping task scheduling")
 			return
 		}
+	}
+
+	// DEBUG: Log how many tasks were actually scheduled
+	if scheduledCount > 0 {
+		log.Printf("DEBUG: Successfully scheduled %d import tasks", scheduledCount)
 	}
 }
 
@@ -269,8 +285,13 @@ func (m *ImportManager) getPendingImportTasks() ([]ImportTask, error) {
 		ORDER BY pi.site_database, pi.site_table, pi.page_num
 		LIMIT 500`
 
+	// DEBUG: Log the query and database
+	log.Printf("DEBUG: Executing getPendingImportTasks query for database: %s", dbConfig.Database)
+	log.Printf("DEBUG: Query: %s", query)
+
 	rows, err := m.sourceDB.Query(query)
 	if err != nil {
+		log.Printf("DEBUG: Query failed with error: %v", err)
 		return nil, fmt.Errorf("failed to query pending import tasks: %w", err)
 	}
 	defer rows.Close()
@@ -297,6 +318,13 @@ func (m *ImportManager) getPendingImportTasks() ([]ImportTask, error) {
 		}
 
 		tasks = append(tasks, task)
+	}
+
+	// DEBUG: Log what we found
+	log.Printf("DEBUG: Query returned %d tasks", len(tasks))
+	if len(tasks) > 0 {
+		log.Printf("DEBUG: First task: database=%s, table=%s, page_num=%d, page_id=%d",
+			tasks[0].Database, tasks[0].Table, tasks[0].PageInfo.PageNum, tasks[0].PageInfo.ID)
 	}
 
 	return tasks, nil
@@ -476,7 +504,7 @@ func (m *ImportManager) printImportProgress() {
 		SELECT site_database, site_table, page_number, 
 			   import_completed_pages, import_failed_pages, import_running_pages
 		FROM sitemerge.export_import_summary 
-		WHERE import_status IN ('running', 'success')
+		WHERE import_status IN ('running', 'success') 
 		ORDER BY site_database, site_table`
 
 	rows, err := m.sourceDB.Query(query)
@@ -492,7 +520,6 @@ func (m *ImportManager) printImportProgress() {
 		"Database", "Table", "Total", "Completed", "Failed", "Running", "Progress")
 	fmt.Printf("%s\n", strings.Repeat("-", 108))
 
-	totalTables := 0
 	completedTables := 0
 
 	for rows.Next() {
@@ -505,7 +532,9 @@ func (m *ImportManager) printImportProgress() {
 			continue
 		}
 
-		totalTables++
+		if !slices.Contains(m.tableToProcess, table) {
+			continue
+		}
 
 		var progressPercent float64
 		if totalPages > 0 {
@@ -524,7 +553,7 @@ func (m *ImportManager) printImportProgress() {
 			database, table, totalPages, completedPages, failedPages, runningPages, progressStr)
 	}
 
-	fmt.Printf("\n📈 Overall Progress: %d/%d tables completed\n", completedTables, totalTables)
+	fmt.Printf("\n📈 Overall Progress: %d/%d tables completed\n", completedTables, len(m.tableToProcess))
 	fmt.Println(strings.Repeat("=", 108))
 }
 
@@ -777,6 +806,8 @@ func (m *ImportManager) Run() error {
 		return err
 	}
 
+	m.tableToProcess = tables
+
 	if len(tables) == 0 {
 		return fmt.Errorf("no tables found to process (export must be completed first)")
 	}
@@ -790,7 +821,7 @@ func (m *ImportManager) Run() error {
 	fmt.Printf("🚀 Starting IMPORT operation with parameters:\n")
 	fmt.Printf("   Source DB: %s:%d/%s\n", dbConfig.Host, dbConfig.Port, dbConfig.Database)
 	fmt.Printf("   Dest DB: %s:%d/%s\n", dstDbConfig.Host, dstDbConfig.Port, dstDbConfig.Database)
-	fmt.Printf("   Tables: %v\n", tables)
+	fmt.Printf("   There are %d tables to import, Tables: %v\n", len(m.tableToProcess), m.tableToProcess)
 	fmt.Printf("   Threads: %d\n", m.threads)
 
 	// Set up signal handling for graceful shutdown
