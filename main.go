@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"database/sql"
 	"fmt"
 	"log"
 	"os"
+	"strings"
 
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
@@ -80,6 +82,15 @@ in the sitemerge.export_import_summary table with resume capability.`,
 	Run: runImport,
 }
 
+var truncateTableCmd = &cobra.Command{
+	Use:   "truncate-table",
+	Short: "Truncate all tables in target database",
+	Long: `Truncate all tables in the target database.
+This command will remove all data from all tables in the specified database.
+WARNING: This operation is irreversible and will delete all data.`,
+	Run: runTruncateTable,
+}
+
 func init() {
 	// Global flags
 	rootCmd.PersistentFlags().StringVar(&dbConfig.Host, "host", "", "TiDB host address (required)")
@@ -118,11 +129,15 @@ func init() {
 	importCmd.MarkFlagRequired("dst-password")
 	importCmd.MarkFlagRequired("dst-database")
 
+	// truncate-table command flags
+	truncateTableCmd.Flags().Bool("force", false, "Skip confirmation prompt")
+
 	// Add subcommands
 	rootCmd.AddCommand(tableIndexCmd)
 	rootCmd.AddCommand(pageInfoCmd)
 	rootCmd.AddCommand(exportCmd)
 	rootCmd.AddCommand(importCmd)
+	rootCmd.AddCommand(truncateTableCmd)
 }
 
 func main() {
@@ -265,4 +280,115 @@ func runImport(cmd *cobra.Command, args []string) {
 		log.Printf("❌ %v\n", err)
 		os.Exit(1)
 	}
+}
+
+func runTruncateTable(cmd *cobra.Command, args []string) {
+	force, _ := cmd.Flags().GetBool("force")
+
+	// Connect to database
+	db, err := connectDB(10)
+	if err != nil {
+		log.Printf("❌ %v\n", err)
+		os.Exit(1)
+	}
+	defer db.Close()
+
+	if err := truncateAllTables(db, dbConfig.Database, force); err != nil {
+		log.Printf("❌ %v\n", err)
+		os.Exit(1)
+	}
+}
+
+// truncateAllTables truncates all tables in the specified database
+func truncateAllTables(db *sql.DB, database string, force bool) error {
+	// Get all tables in the database
+	query := `
+		SELECT table_name 
+		FROM information_schema.tables 
+		WHERE table_schema = ? 
+		AND table_type = 'BASE TABLE'
+		ORDER BY table_name
+	`
+
+	rows, err := db.Query(query, database)
+	if err != nil {
+		return fmt.Errorf("failed to query tables: %w", err)
+	}
+	defer rows.Close()
+
+	var tables []string
+	for rows.Next() {
+		var tableName string
+		if err := rows.Scan(&tableName); err != nil {
+			return fmt.Errorf("failed to scan table name: %w", err)
+		}
+		tables = append(tables, tableName)
+	}
+
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("failed to iterate tables: %w", err)
+	}
+
+	if len(tables) == 0 {
+		log.Printf("✅ No tables found in database '%s'\n", database)
+		return nil
+	}
+
+	log.Printf("📋 Found %d tables in database '%s':\n", len(tables), database)
+	for _, table := range tables {
+		log.Printf("   - %s\n", table)
+	}
+
+	// Ask for confirmation if not forced
+	if !force {
+		log.Printf("\n⚠️  WARNING: This operation will permanently delete all data from %d tables!\n", len(tables))
+		log.Printf("Are you sure you want to proceed? (y/N): ")
+
+		reader := bufio.NewReader(os.Stdin)
+		response, err := reader.ReadString('\n')
+		if err != nil {
+			return fmt.Errorf("failed to read user input: %w", err)
+		}
+
+		response = strings.TrimSpace(strings.ToLower(response))
+		if response != "y" && response != "yes" {
+			log.Printf("❌ Operation cancelled by user\n")
+			return nil
+		}
+	}
+
+	// Disable foreign key checks to avoid constraint issues
+	log.Printf("🔧 Disabling foreign key checks...\n")
+	if _, err := db.Exec("SET FOREIGN_KEY_CHECKS = 0"); err != nil {
+		return fmt.Errorf("failed to disable foreign key checks: %w", err)
+	}
+
+	// Truncate each table
+	successCount := 0
+	for _, table := range tables {
+		log.Printf("🗑️  Truncating table: %s...", table)
+
+		truncateQuery := fmt.Sprintf("TRUNCATE TABLE `%s`.`%s`", database, table)
+		if _, err := db.Exec(truncateQuery); err != nil {
+			log.Printf(" ❌ Failed: %v\n", err)
+			continue
+		}
+
+		log.Printf(" ✅ Done\n")
+		successCount++
+	}
+
+	// Re-enable foreign key checks
+	log.Printf("🔧 Re-enabling foreign key checks...\n")
+	if _, err := db.Exec("SET FOREIGN_KEY_CHECKS = 1"); err != nil {
+		return fmt.Errorf("failed to re-enable foreign key checks: %w", err)
+	}
+
+	log.Printf("✅ Successfully truncated %d/%d tables in database '%s'\n", successCount, len(tables), database)
+
+	if successCount != len(tables) {
+		return fmt.Errorf("failed to truncate %d tables", len(tables)-successCount)
+	}
+
+	return nil
 }

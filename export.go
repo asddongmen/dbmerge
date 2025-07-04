@@ -317,6 +317,8 @@ func (m *ExportManager) scheduleExportTasks() {
 	}
 
 	if len(tables) == 0 {
+		// No pending or running tables, check if all tables are completed and exit if so
+		m.checkAllTablesCompleteAndExit()
 		return
 	}
 
