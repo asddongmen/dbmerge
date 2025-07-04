@@ -222,9 +222,6 @@ func (m *ImportManager) scheduleImportTasks() {
 	// First, reset any running tasks that have been stuck for too long
 	m.resetStuckImportTasks()
 
-	// DEBUG: Add logging to understand what's happening
-	log.Printf("DEBUG: Starting to schedule import tasks...")
-
 	// Get pending import tasks based on page status
 	tasks, err := m.getPendingImportTasks()
 	if err != nil {
@@ -232,24 +229,13 @@ func (m *ImportManager) scheduleImportTasks() {
 		return
 	}
 
-	// DEBUG: Log the number of tasks found
-	log.Printf("DEBUG: Found %d pending import tasks", len(tasks))
-
 	// Schedule tasks
-	scheduledCount := 0
 	for _, task := range tasks {
 		select {
 		case m.importTaskChan <- task:
-			scheduledCount++
 		case <-m.ctx.Done():
-			log.Printf("DEBUG: Context cancelled, stopping task scheduling")
 			return
 		}
-	}
-
-	// DEBUG: Log how many tasks were actually scheduled
-	if scheduledCount > 0 {
-		log.Printf("DEBUG: Successfully scheduled %d import tasks", scheduledCount)
 	}
 }
 
@@ -285,13 +271,8 @@ func (m *ImportManager) getPendingImportTasks() ([]ImportTask, error) {
 		ORDER BY pi.site_database, pi.site_table, pi.page_num
 		LIMIT 500`
 
-	// DEBUG: Log the query and database
-	log.Printf("DEBUG: Executing getPendingImportTasks query for database: %s", dbConfig.Database)
-	log.Printf("DEBUG: Query: %s", query)
-
 	rows, err := m.sourceDB.Query(query)
 	if err != nil {
-		log.Printf("DEBUG: Query failed with error: %v", err)
 		return nil, fmt.Errorf("failed to query pending import tasks: %w", err)
 	}
 	defer rows.Close()
@@ -318,13 +299,6 @@ func (m *ImportManager) getPendingImportTasks() ([]ImportTask, error) {
 		}
 
 		tasks = append(tasks, task)
-	}
-
-	// DEBUG: Log what we found
-	log.Printf("DEBUG: Query returned %d tasks", len(tasks))
-	if len(tasks) > 0 {
-		log.Printf("DEBUG: First task: database=%s, table=%s, page_num=%d, page_id=%d",
-			tasks[0].Database, tasks[0].Table, tasks[0].PageInfo.PageNum, tasks[0].PageInfo.ID)
 	}
 
 	return tasks, nil
@@ -492,6 +466,25 @@ func (m *ImportManager) printImportProgress() {
 	if elapsedTime > 0 {
 		newRows := currentImportedRows - m.lastImportedRows
 		importRate = float64(newRows) / elapsedTime
+	}
+
+	// Check if import is completed
+	tables, err := m.GetTablesToProcess()
+	if err != nil {
+		log.Printf("Error getting tables to process: %v", err)
+	}
+	_, err = m.checkAndFixImportStatus(tables)
+	if err != nil {
+		log.Printf("Error checking and fixing import status: %v", err)
+	}
+	tables, err = m.GetTablesToProcess()
+	if err != nil {
+		log.Printf("Error getting tables to process: %v", err)
+	}
+	if len(tables) == 0 {
+		fmt.Printf("🎉 All tables have been successfully imported!\n")
+		m.cancel()
+		return
 	}
 
 	// Update last stats
@@ -797,6 +790,105 @@ func (m *ImportManager) markImportPageAsSuccess(database, table string, pageID i
 	}
 }
 
+// checkAndFixImportStatus checks and fixes import status inconsistencies
+func (m *ImportManager) checkAndFixImportStatus(tables []string) (int, error) {
+	fixedCount := 0
+	fixedTables := []string{}
+
+	for _, table := range tables {
+		// Check if all pages for this table have been successfully imported
+		var totalPages, successPages int64
+
+		err := m.sourceDB.QueryRow(`
+			SELECT 
+				COUNT(*) as total_pages,
+				SUM(CASE WHEN pos.import_status = 'success' THEN 1 ELSE 0 END) as success_pages
+			FROM sitemerge.page_info pi
+			LEFT JOIN sitemerge.page_operation_status pos 
+				ON pi.site_database = pos.site_database 
+				AND pi.site_table = pos.site_table 
+				AND pi.id = pos.page_id
+			WHERE pi.site_database = ? AND pi.site_table = ?`,
+			dbConfig.Database, table).Scan(&totalPages, &successPages)
+
+		if err != nil {
+			log.Printf("Error checking import status for table %s: %v", table, err)
+			continue
+		}
+
+		// If all pages are successfully imported, update the summary table
+		if totalPages > 0 && successPages == totalPages {
+			// Check current status in summary table
+			var currentStatus string
+			err = m.sourceDB.QueryRow(`
+				SELECT import_status 
+				FROM sitemerge.export_import_summary 
+				WHERE site_database = ? AND site_table = ?`,
+				dbConfig.Database, table).Scan(&currentStatus)
+
+			if err != nil {
+				log.Printf("Error getting current import status for table %s: %v", table, err)
+				continue
+			}
+
+			// Update if not already marked as success
+			if currentStatus != "success" {
+				_, err = m.sourceDB.Exec(`
+					UPDATE sitemerge.export_import_summary 
+					SET import_status = 'success', 
+						import_time = NOW(),
+						import_completed_pages = ?,
+						import_failed_pages = 0,
+						import_running_pages = 0
+					WHERE site_database = ? AND site_table = ?`,
+					totalPages, dbConfig.Database, table)
+
+				if err != nil {
+					log.Printf("Error updating import status for table %s: %v", table, err)
+					continue
+				}
+
+				fmt.Printf("✅ Fixed import status for table %s (%d/%d pages completed)\n",
+					table, successPages, totalPages)
+				fixedCount++
+				fixedTables = append(fixedTables, table)
+			}
+		} else if totalPages > 0 {
+			// Some pages are not completed, update the counts
+			var failedPages, runningPages int64
+			err = m.sourceDB.QueryRow(`
+				SELECT 
+					SUM(CASE WHEN pos.import_status = 'failed' THEN 1 ELSE 0 END) as failed_pages,
+					SUM(CASE WHEN pos.import_status = 'running' THEN 1 ELSE 0 END) as running_pages
+				FROM sitemerge.page_info pi
+				LEFT JOIN sitemerge.page_operation_status pos 
+					ON pi.site_database = pos.site_database 
+					AND pi.site_table = pos.site_table 
+					AND pi.id = pos.page_id
+				WHERE pi.site_database = ? AND pi.site_table = ?`,
+				dbConfig.Database, table).Scan(&failedPages, &runningPages)
+
+			if err == nil {
+				// Update summary with accurate counts
+				_, err = m.sourceDB.Exec(`
+					UPDATE sitemerge.export_import_summary 
+					SET import_completed_pages = ?,
+						import_failed_pages = ?,
+						import_running_pages = ?,
+						page_number = ?
+					WHERE site_database = ? AND site_table = ?`,
+					successPages, failedPages, runningPages, totalPages, dbConfig.Database, table)
+
+				if err != nil {
+					log.Printf("Error updating page counts for table %s: %v", table, err)
+				}
+			}
+		}
+	}
+
+	return fixedCount, nil
+}
+
 // Run starts the import process
 func (m *ImportManager) Run() error {
 
@@ -810,6 +902,29 @@ func (m *ImportManager) Run() error {
 
 	if len(tables) == 0 {
 		return fmt.Errorf("no tables found to process (export must be completed first)")
+	}
+
+	// Check and fix import status inconsistencies first
+	fmt.Printf("🔍 Checking import status consistency...\n")
+	fixedTables, err := m.checkAndFixImportStatus(tables)
+	if err != nil {
+		return fmt.Errorf("failed to check import status: %w", err)
+	}
+
+	if fixedTables > 0 {
+		fmt.Printf("✅ Fixed import status for %d tables\n", fixedTables)
+
+		// Re-get tables to process after fixing status
+		tables, err = m.GetTablesToProcess()
+		if err != nil {
+			return err
+		}
+		m.tableToProcess = tables
+
+		if len(tables) == 0 {
+			fmt.Printf("🎉 All tables have been successfully imported!\n")
+			return nil
+		}
 	}
 
 	// Initialize import summary
