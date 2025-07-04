@@ -155,10 +155,10 @@ func (m *ImportManager) initializePageOperationStatus(database, table string) er
 		(site_database, site_table, page_id, page_num, export_status, import_status)
 		SELECT site_database, site_table, id, page_num, 'success', 'pending'
 		FROM sitemerge.page_info 
-		WHERE site_database = ? AND site_table = ? AND import_status != 'success'
+		WHERE site_database = ? AND site_table = ?
 		ON DUPLICATE KEY UPDATE 
 			import_status = CASE 
-				WHEN export_status = 'success' THEN 'pending' 
+				WHEN import_status != 'success' THEN 'pending' 
 				ELSE import_status 
 			END,
 			updated_at = NOW()`
@@ -427,8 +427,8 @@ func (m *ImportManager) processImportTask(task ImportTask) {
 		if err != nil {
 			// Check if it's a duplicate key error
 			if strings.Contains(err.Error(), "Duplicate entry") || strings.Contains(err.Error(), "duplicate key") {
-				log.Printf("Warning: Duplicate key error for table %s.%s page %d: %v",
-					task.Database, task.Table, task.PageInfo.PageNum, err)
+				// log.Printf("Warning: Duplicate key error for table %s.%s page %d: %v",
+				// 	task.Database, task.Table, task.PageInfo.PageNum, err)
 				// Still mark as success since data already exists
 				insertedRows = len(batchData)
 			} else {
