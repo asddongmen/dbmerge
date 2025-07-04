@@ -26,11 +26,12 @@ func (c *DBConfig) GetDSN() string {
 }
 
 var (
-	dbConfig    DBConfig
-	dstDbConfig DBConfig
-	pageSize    int
-	threads     int
-	tableName   string
+	dbConfig              DBConfig
+	dstDbConfig           DBConfig
+	pageSize              int
+	threads               int
+	tableName             string
+	skipCheckExportStatus bool
 )
 
 var rootCmd = &cobra.Command{
@@ -109,6 +110,7 @@ func init() {
 	importCmd.Flags().StringVar(&dstDbConfig.Database, "dst-database", "", "Destination database name (required)")
 	importCmd.Flags().IntVar(&threads, "threads", 8, "Number of worker threads (1-512, default: 8)")
 	importCmd.Flags().StringVar(&tableName, "table-name", "", "Specific table name to process (default: all tables)")
+	importCmd.Flags().BoolVar(&skipCheckExportStatus, "skip-check-export-status", false, "Skip checking export status")
 
 	// Mark required flags for import command
 	importCmd.MarkFlagRequired("dst-host")
@@ -258,7 +260,7 @@ func runImport(cmd *cobra.Command, args []string) {
 	defer destDB.Close()
 
 	// Create and run import manager
-	manager := NewImportManager(sourceDB, destDB, threads, tableName)
+	manager := NewImportManager(sourceDB, destDB, threads, tableName, skipCheckExportStatus)
 	if err := manager.Run(); err != nil {
 		log.Printf("❌ %v\n", err)
 		os.Exit(1)

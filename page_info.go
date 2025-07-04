@@ -632,10 +632,12 @@ func (p *PageInfoGenerator) processSingleTable(resumePoint ResumePoint, isResume
 	}
 
 	batchCount := 0
-	var allValues []int64 // Store all values across batches
 	processedRows := existingProcessedRows
+	totalPages := 0
 
-	// First, collect all data in batches
+	log.Printf("    Starting data collection and page generation for table %s.%s", dbName, tableName)
+
+	// Process data in batches and generate pages immediately
 	for {
 		// Generate raw data for current batch
 		batchValues, maxEndKey, err := p.generatePageInfoBatch(dbName, tableName, divideColumn, lastMaxID)
@@ -646,12 +648,53 @@ func (p *PageInfoGenerator) processSingleTable(resumePoint ResumePoint, isResume
 		}
 
 		if len(batchValues) == 0 {
+			log.Printf("    No more data for table %s.%s, breaking loop", dbName, tableName)
 			break
 		}
 
-		allValues = append(allValues, batchValues...)
 		batchCount++
 		processedRows += int64(len(batchValues))
+
+		// Generate pages for this batch immediately
+		if len(batchValues) > 0 {
+			// Calculate starting page number based on existing processed rows
+			startPageNum := int((processedRows-int64(len(batchValues)))/int64(p.pageSize)) + 1
+
+			var pageData []PageInfo
+			for i := 0; i < len(batchValues); i += p.pageSize {
+				end := i + p.pageSize
+				if end > len(batchValues) {
+					end = len(batchValues)
+				}
+
+				pageChunk := batchValues[i:end]
+				pageNum := startPageNum + (i / p.pageSize)
+				startKey := pageChunk[0]
+				endKey := pageChunk[len(pageChunk)-1]
+				actualPageSize := len(pageChunk)
+
+				pageData = append(pageData, PageInfo{
+					SiteDatabase: dbName,
+					SiteTable:    tableName,
+					PageNum:      pageNum,
+					StartKey:     startKey,
+					EndKey:       endKey,
+					PageSize:     actualPageSize,
+				})
+			}
+
+			// Insert pages for this batch immediately
+			if len(pageData) > 0 {
+
+				if err := p.insertPageInfoBatch(dbName, tableName, pageData); err != nil {
+					// Mark as failed before returning error
+					p.updateProgress(dbName, tableName, "failed", maxEndKey, tableRows, processedRows)
+					return 0, fmt.Errorf("failed to insert page info batch: %w", err)
+				}
+
+				totalPages += len(pageData)
+			}
+		}
 
 		// Update global statistics
 		p.mu.Lock()
@@ -667,6 +710,7 @@ func (p *PageInfoGenerator) processSingleTable(resumePoint ResumePoint, isResume
 
 		// Check if we've processed all data
 		if len(batchValues) < batchSize {
+			log.Printf("    Batch size (%d) < batchSize (%d), breaking loop", len(batchValues), batchSize)
 			break
 		}
 
@@ -674,45 +718,7 @@ func (p *PageInfoGenerator) processSingleTable(resumePoint ResumePoint, isResume
 		lastMaxID = &maxEndKey
 	}
 
-	// Now process all values to generate pages
-	totalPages := 0
-	if len(allValues) > 0 {
-		// Calculate starting page number based on existing processed rows
-		startPageNum := int(existingProcessedRows/int64(p.pageSize)) + 1
-
-		var pageData []PageInfo
-		for i := 0; i < len(allValues); i += p.pageSize {
-			end := i + p.pageSize
-			if end > len(allValues) {
-				end = len(allValues)
-			}
-
-			pageChunk := allValues[i:end]
-			pageNum := startPageNum + (i / p.pageSize)
-			startKey := pageChunk[0]
-			endKey := pageChunk[len(pageChunk)-1]
-			actualPageSize := len(pageChunk)
-
-			pageData = append(pageData, PageInfo{
-				SiteDatabase: dbName,
-				SiteTable:    tableName,
-				PageNum:      pageNum,
-				StartKey:     startKey,
-				EndKey:       endKey,
-				PageSize:     actualPageSize,
-			})
-		}
-
-		// Insert all page info at once
-		if err := p.insertPageInfoBatch(dbName, tableName, pageData); err != nil {
-			// Mark as failed before returning error
-			p.updateProgress(dbName, tableName, "failed", 0, tableRows, processedRows)
-			return 0, fmt.Errorf("failed to insert page info batch: %w", err)
-		}
-		totalPages = len(pageData)
-
-		log.Printf("    Generated %d pages from %d rows", totalPages, len(allValues))
-	}
+	log.Printf("    Table %s.%s processing completed successfully: %d pages generated", dbName, tableName, totalPages)
 
 	// Mark as completed
 	if err := p.updateProgress(dbName, tableName, "completed", 0, tableRows, processedRows); err != nil {

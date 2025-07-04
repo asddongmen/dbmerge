@@ -65,10 +65,12 @@ type ImportManager struct {
 	lastImportedRows  int64
 	lastStatsTime     time.Time
 	statsMutex        sync.RWMutex
+
+	skipCheckExportStatus bool
 }
 
 // NewImportManager creates a new import manager
-func NewImportManager(sourceDB, destDB *sql.DB, threads int, tableName string) *ImportManager {
+func NewImportManager(sourceDB, destDB *sql.DB, threads int, tableName string, skipCheckExportStatus bool) *ImportManager {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &ImportManager{
 		sourceDB:       sourceDB,
@@ -87,17 +89,22 @@ func NewImportManager(sourceDB, destDB *sql.DB, threads int, tableName string) *
 // GetTablesToProcess returns the list of tables to process for import
 func (m *ImportManager) GetTablesToProcess() ([]string, error) {
 	var tables []string
+	query := `
+	SELECT DISTINCT site_table 
+	FROM sitemerge.export_import_summary 
+	WHERE site_database = ?%s`
+
+	if m.skipCheckExportStatus {
+		query = fmt.Sprintf(query, "")
+	} else {
+		query = fmt.Sprintf(query, " AND export_status = 'success'")
+	}
 
 	if m.tableName != "" {
 		// Process specific table
 		tables = append(tables, m.tableName)
 	} else {
 		// Get all tables that are ready for import (export completed successfully)
-		query := `
-			SELECT DISTINCT site_table 
-			FROM sitemerge.export_import_summary 
-			WHERE site_database = ? AND export_status = 'success'`
-
 		rows, err := m.sourceDB.Query(query, dbConfig.Database)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get tables from export_import_summary: %w", err)
@@ -123,7 +130,7 @@ func (m *ImportManager) InitializeImportSummary(tables []string) error {
 		updateSQL := `
 			UPDATE sitemerge.export_import_summary 
 			SET import_status = 'pending'
-			WHERE site_database = ? AND site_table = ? AND export_status = 'success'`
+			WHERE site_database = ? AND site_table = ? and import_status != 'success'`
 
 		_, err := m.sourceDB.Exec(updateSQL, dbConfig.Database, table)
 		if err != nil {
@@ -148,7 +155,7 @@ func (m *ImportManager) initializePageOperationStatus(database, table string) er
 		(site_database, site_table, page_id, page_num, export_status, import_status)
 		SELECT site_database, site_table, id, page_num, 'success', 'pending'
 		FROM sitemerge.page_info 
-		WHERE site_database = ? AND site_table = ?
+		WHERE site_database = ? AND site_table = ? AND import_status != 'success'
 		ON DUPLICATE KEY UPDATE 
 			import_status = CASE 
 				WHEN export_status = 'success' THEN 'pending' 
@@ -311,8 +318,6 @@ func (m *ImportManager) ImportWorker() {
 
 // processImportTask processes a single import task
 func (m *ImportManager) processImportTask(task ImportTask) {
-	fmt.Printf("🔄 Importing %s.%s page %d (keys: %d-%d)\n",
-		task.Database, task.Table, task.PageInfo.PageNum, task.PageInfo.StartKey, task.PageInfo.EndKey)
 
 	// Atomically mark this page as running
 	if !m.markImportPageAsRunning(task.Database, task.Table, task.PageInfo.ID) {

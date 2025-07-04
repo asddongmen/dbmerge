@@ -528,24 +528,18 @@ func TestProcessSingleTable(t *testing.T) {
 				mock.ExpectQuery("SELECT /\\*\\+ READ_FROM_STORAGE\\(TIKV\\) \\*/ id").
 					WillReturnRows(rows)
 
-				// Update progress after first batch
-				mock.ExpectExec("INSERT INTO sitemerge.page_info_progress").
-					WithArgs("test_db", "test_table", "processing", int64(10), int64(5000), int64(10)).
-					WillReturnResult(sqlmock.NewResult(0, 1))
-
-				// Second batch query - empty result (since first batch < batchSize, loop continues)
-				emptyRows := sqlmock.NewRows([]string{"id"})
-				mock.ExpectQuery("SELECT /\\*\\+ READ_FROM_STORAGE\\(TIKV\\) \\*/ id").
-					WithArgs(int64(10)).
-					WillReturnRows(emptyRows)
-
-				// Insert page info batch - transaction operations
+				// Insert page info batch - transaction operations (happens before progress update)
 				mock.ExpectBegin()
 				mock.ExpectPrepare("INSERT INTO sitemerge.page_info")
 				mock.ExpectExec("INSERT INTO sitemerge.page_info").
 					WithArgs("test_db", "test_table", 1, int64(1), int64(10), 10).
 					WillReturnResult(sqlmock.NewResult(0, 1))
 				mock.ExpectCommit()
+
+				// Update progress after first batch
+				mock.ExpectExec("INSERT INTO sitemerge.page_info_progress").
+					WithArgs("test_db", "test_table", "processing", int64(10), int64(5000), int64(10)).
+					WillReturnResult(sqlmock.NewResult(0, 1))
 
 				// Mark as completed
 				mock.ExpectExec("INSERT INTO sitemerge.page_info_progress").
@@ -581,17 +575,6 @@ func TestProcessSingleTable(t *testing.T) {
 					WithArgs(int64(1000)).
 					WillReturnRows(rows)
 
-				// Update progress after batch
-				mock.ExpectExec("INSERT INTO sitemerge.page_info_progress").
-					WithArgs("test_db", "test_table", "processing", int64(1005), int64(10000), int64(1005)).
-					WillReturnResult(sqlmock.NewResult(0, 1))
-
-				// Next batch - empty result (since first batch < batchSize, loop continues)
-				emptyRows := sqlmock.NewRows([]string{"id"})
-				mock.ExpectQuery("SELECT /\\*\\+ READ_FROM_STORAGE\\(TIKV\\) \\*/ id").
-					WithArgs(int64(1005)).
-					WillReturnRows(emptyRows)
-
 				// Insert page info batch (page 2 since we already processed 1000 rows) - transaction operations
 				mock.ExpectBegin()
 				mock.ExpectPrepare("INSERT INTO sitemerge.page_info")
@@ -599,6 +582,11 @@ func TestProcessSingleTable(t *testing.T) {
 					WithArgs("test_db", "test_table", 2, int64(1001), int64(1005), 5).
 					WillReturnResult(sqlmock.NewResult(0, 1))
 				mock.ExpectCommit()
+
+				// Update progress after batch
+				mock.ExpectExec("INSERT INTO sitemerge.page_info_progress").
+					WithArgs("test_db", "test_table", "processing", int64(1005), int64(10000), int64(1005)).
+					WillReturnResult(sqlmock.NewResult(0, 1))
 
 				// Mark as completed
 				mock.ExpectExec("INSERT INTO sitemerge.page_info_progress").
@@ -640,17 +628,6 @@ func TestProcessSingleTable(t *testing.T) {
 				mock.ExpectQuery("SELECT /\\*\\+ READ_FROM_STORAGE\\(TIKV\\) \\*/ id").
 					WillReturnRows(rows1)
 
-				// Update progress after first batch
-				mock.ExpectExec("INSERT INTO sitemerge.page_info_progress").
-					WithArgs("test_db", "test_table", "processing", int64(2500), int64(5000), int64(2500)).
-					WillReturnResult(sqlmock.NewResult(0, 1))
-
-				// Second batch - empty result (since first batch < batchSize, loop continues)
-				emptyRows := sqlmock.NewRows([]string{"id"})
-				mock.ExpectQuery("SELECT /\\*\\+ READ_FROM_STORAGE\\(TIKV\\) \\*/ id").
-					WithArgs(int64(2500)).
-					WillReturnRows(emptyRows)
-
 				// Insert page info batch - 3 pages (1000, 1000, 500) - transaction operations
 				mock.ExpectBegin()
 				mock.ExpectPrepare("INSERT INTO sitemerge.page_info")
@@ -664,6 +641,11 @@ func TestProcessSingleTable(t *testing.T) {
 					WithArgs("test_db", "test_table", 3, int64(2001), int64(2500), 500).
 					WillReturnResult(sqlmock.NewResult(0, 1))
 				mock.ExpectCommit()
+
+				// Update progress after first batch
+				mock.ExpectExec("INSERT INTO sitemerge.page_info_progress").
+					WithArgs("test_db", "test_table", "processing", int64(2500), int64(5000), int64(2500)).
+					WillReturnResult(sqlmock.NewResult(0, 1))
 
 				// Mark as completed
 				mock.ExpectExec("INSERT INTO sitemerge.page_info_progress").
@@ -781,12 +763,6 @@ func TestProcessSingleTable(t *testing.T) {
 					WithArgs("test_db", "insert_error_table", "processing", int64(3), int64(1000), int64(3)).
 					WillReturnResult(sqlmock.NewResult(0, 1))
 
-				// Second batch - empty result (since first batch < batchSize, loop continues)
-				emptyRows := sqlmock.NewRows([]string{"id"})
-				mock.ExpectQuery("SELECT /\\*\\+ READ_FROM_STORAGE\\(TIKV\\) \\*/ id").
-					WithArgs(int64(3)).
-					WillReturnRows(emptyRows)
-
 				// Insert page info batch fails
 				mock.ExpectBegin()
 				mock.ExpectPrepare("INSERT INTO sitemerge.page_info").
@@ -794,7 +770,7 @@ func TestProcessSingleTable(t *testing.T) {
 
 				// Mark as failed
 				mock.ExpectExec("INSERT INTO sitemerge.page_info_progress").
-					WithArgs("test_db", "insert_error_table", "failed", int64(0), int64(1000), int64(3)).
+					WithArgs("test_db", "insert_error_table", "failed", int64(3), int64(1000), int64(3)).
 					WillReturnResult(sqlmock.NewResult(0, 1))
 			},
 			expectedPages:  0,
@@ -845,7 +821,7 @@ func TestProcessSingleTable(t *testing.T) {
 			}
 
 			if !tt.expectedError && tt.expectedPages > 0 {
-				assert.Contains(t, logContent, fmt.Sprintf("Generated %d pages", tt.expectedPages), "Should log pages generated")
+				assert.Contains(t, logContent, fmt.Sprintf("%d pages generated", tt.expectedPages), "Should log pages generated")
 			}
 		})
 	}
