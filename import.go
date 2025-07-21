@@ -432,6 +432,14 @@ func (m *ImportManager) processImportTask(task ImportTask) {
 				// log.Printf("Warning: Duplicate key error for table %s.%s page %d: %v",
 				// 	task.Database, task.Table, task.PageInfo.PageNum, err)
 				// Still mark as success since data already exists
+				batchReplaceSQL := fmt.Sprintf("REPLACE INTO %s.%s (%s) VALUES %s",
+					dstDbConfig.Database, task.Table, sqlCache.ColumnList, valuesClause)
+				_, err := m.destDB.Exec(batchReplaceSQL, allValues...)
+				if err != nil {
+					log.Printf("Error executing batch replace for table %s.%s: %v", task.Database, task.Table, err)
+					m.markImportPageAsFailed(task.Database, task.Table, task.PageInfo.ID, fmt.Sprintf("Failed to execute batch replace: %v", err))
+					return
+				}
 				insertedRows = len(batchData)
 			} else {
 				log.Printf("Error executing batch insert for table %s.%s: %v", task.Database, task.Table, err)
