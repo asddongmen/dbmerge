@@ -75,16 +75,17 @@ type ImportManager struct {
 func NewImportManager(sourceDB, destDB *sql.DB, threads int, tableName string, skipCheckExportStatus bool) *ImportManager {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &ImportManager{
-		sourceDB:       sourceDB,
-		destDB:         destDB,
-		threads:        threads,
-		tableName:      tableName,
-		ctx:            ctx,
-		cancel:         cancel,
-		importTaskChan: make(chan ImportTask, 100),
-		missingTables:  make([]string, 0),
-		lastStatsTime:  time.Now(),
-		sqlCache:       make(map[string]*TableSQLCache),
+		sourceDB:              sourceDB,
+		destDB:                destDB,
+		threads:               threads,
+		tableName:             tableName,
+		ctx:                   ctx,
+		cancel:                cancel,
+		importTaskChan:        make(chan ImportTask, 100),
+		missingTables:         make([]string, 0),
+		lastStatsTime:         time.Now(),
+		sqlCache:              make(map[string]*TableSQLCache),
+		skipCheckExportStatus: skipCheckExportStatus,
 	}
 }
 
