@@ -27,42 +27,43 @@ CREATE TABLE IF NOT EXISTS sitemerge.sitemerge_table_index_info (
 )`
 
 	tableIndexQuery = `
-SELECT DISTINCT
-    t.TABLE_SCHEMA as site_database,
-    t.TABLE_NAME as site_table,
-    CASE 
+select site_database, site_table, clustered_index,clustered_columns,
+IF(LOCATE(',', clustered_columns) > 0, 'Yes', 'No') AS com_clusted_index, table_rows 
+from 
+(SELECT
+    t.TABLE_SCHEMA AS site_database,
+    t.TABLE_NAME AS site_table,
+    -- 聚簇索引状态
+    CASE
         WHEN EXISTS (
-            SELECT 1 FROM INFORMATION_SCHEMA.STATISTICS s2 
-            WHERE s2.TABLE_SCHEMA = t.TABLE_SCHEMA 
-            AND s2.TABLE_NAME = t.TABLE_NAME 
-            AND s2.INDEX_NAME = 'PRIMARY'
+            SELECT 1
+            FROM information_schema.tidb_indexes idx
+            WHERE
+                idx.TABLE_SCHEMA = t.TABLE_SCHEMA
+                AND idx.TABLE_NAME = t.TABLE_NAME
+                AND idx.KEY_NAME = 'PRIMARY'
+                AND idx.CLUSTERED = 'YES'
         ) THEN 'Yes'
         ELSE 'No'
-    END as clustered_index,
-    CASE 
-        WHEN EXISTS (
-            SELECT 1 FROM INFORMATION_SCHEMA.STATISTICS s2 
-            WHERE s2.TABLE_SCHEMA = t.TABLE_SCHEMA 
-            AND s2.TABLE_NAME = t.TABLE_NAME 
-            AND s2.INDEX_NAME = 'PRIMARY'
-        ) THEN (
-            SELECT GROUP_CONCAT(s3.COLUMN_NAME ORDER BY s3.SEQ_IN_INDEX)
-            FROM INFORMATION_SCHEMA.STATISTICS s3
-            WHERE s3.TABLE_SCHEMA = t.TABLE_SCHEMA 
-            AND s3.TABLE_NAME = t.TABLE_NAME 
-            AND s3.INDEX_NAME = 'PRIMARY'
-        )
-        ELSE NULL
-    END as clustered_columns,
-    'No' as com_clusted_index,
-    t.TABLE_ROWS
-FROM 
+    END AS clustered_index,
+    -- 聚簇索引列名
+    IFNULL(
+        (SELECT GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX SEPARATOR ', ')
+         FROM information_schema.tidb_indexes
+         WHERE TABLE_SCHEMA = t.TABLE_SCHEMA
+           AND TABLE_NAME = t.TABLE_NAME
+           AND KEY_NAME = 'PRIMARY'
+           AND CLUSTERED = 'YES'),
+        'N/A'
+    ) AS clustered_columns,
+
+    t.table_rows 
+FROM
     INFORMATION_SCHEMA.TABLES t
-WHERE 
+WHERE
     t.TABLE_SCHEMA = ?
-    AND t.TABLE_TYPE = 'BASE TABLE'
-ORDER BY 
-    t.TABLE_NAME`
+ORDER BY
+    t.TABLE_SCHEMA, t.TABLE_NAME) it;`
 )
 
 // TableInfo represents table index information
