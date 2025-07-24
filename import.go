@@ -820,13 +820,13 @@ func (m *ImportManager) checkAndFixImportStatus(tables []string) (int, error) {
 			WHERE pi.site_database = ? AND pi.site_table = ?`,
 			dbConfig.Database, table).Scan(&totalPages, &successPages)
 
-		if err != nil {
+		if err != nil && !strings.Contains(err.Error(), "NULL") {
 			log.Printf("Error checking import status for table %s: %v", table, err)
 			continue
 		}
 
 		// If all pages are successfully imported, update the summary table
-		if totalPages > 0 && successPages == totalPages {
+		if (totalPages > 0 && successPages == totalPages) || (totalPages == 0 && successPages == 0) {
 			// Check current status in summary table
 			var currentStatus string
 			err = m.sourceDB.QueryRow(`
@@ -972,7 +972,7 @@ func (m *ImportManager) Run() error {
 	m.wg.Add(1)
 	go func() {
 		defer m.wg.Done()
-		ticker := time.NewTicker(5 * time.Second)
+		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 
 		for {
